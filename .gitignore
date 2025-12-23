@@ -44,6 +44,8 @@ logs/
 # RAR files (if you don't want to commit them)
 *.rar
 
-# Config files with sensitive data (optional - uncomment if needed)
-# config.json
+# Config files with sensitive data
+config.json
+setup_telegram.bat
+setup_telegram.ps1
 
