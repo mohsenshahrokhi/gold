@@ -590,7 +590,7 @@ class RiskManager:
             self.max_lots = max_lots if max_lots is not None else 0.3
             self.min_balance = 500.0
             self.max_daily_loss = 0.02
-            self.max_daily_trades = 10
+            self.max_daily_trades = 1000
         
         self.daily_loss_tracker = 0.0
         self.daily_trades = 0
@@ -4148,7 +4148,10 @@ class GoldenmanBot:
                 if positions:
                     self._manage_open_trade(positions[0])
                 else:
-                    if self._is_new_candle(mt5.TIMEFRAME_M1):
+                    if hasattr(self, '_is_market_open') and not self._is_market_open():
+                        logger.debug("⏸️ Market is closed, skipping analysis")
+                        time.sleep(30)
+                    elif self._is_new_candle(mt5.TIMEFRAME_M1):
                         self._analyze_and_trade()
                 
                 if not hasattr(self, '_last_report') or \
@@ -4875,8 +4878,8 @@ class StrategyConfig:
 
         return StrategyConfig(
             name="Super Scalping",
-            trend_tf=mt5.TIMEFRAME_M5,
-            coarse_analysis_tf=mt5.TIMEFRAME_M3,
+            trend_tf=mt5.TIMEFRAME_M3,
+            coarse_analysis_tf=mt5.TIMEFRAME_M1,
             fine_analysis_tf=mt5.TIMEFRAME_M1,
             entry_tf=mt5.TIMEFRAME_M1,
             exit_signal_tf=mt5.TIMEFRAME_M3,
@@ -5400,6 +5403,14 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                     time.sleep(1)
                     continue
                 
+                if not self._is_market_open():
+                    if self._switch_to_bitcoin_if_market_closed():
+                        logger.info("🔄 Switched to BTCUSD, continuing analysis...")
+                        continue
+                    logger.debug("⏸️ Market is closed, skipping analysis")
+                    time.sleep(30)
+                    continue
+                
                 logger.info("🔍 Analyzing for new trade...")
                 
                 if hasattr(self.nds, 'optimized_analyze'):
@@ -5421,6 +5432,16 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 logger.info(f"   TP: {signal.take_profit:.2f}")
                 logger.info(f"   Confidence: {signal.confidence:.2%}")
                 logger.info(f"   R/R: {signal.risk_reward:.2f}")
+                
+                if self.strategy_name == "super_scalping":
+                    main_trend = self._get_main_trend()
+                    if main_trend != TrendDirection.NEUTRAL and signal.direction != main_trend:
+                        logger.warning(f"⚠️ Counter-trend trade rejected for super_scalping")
+                        logger.info(f"   Main Trend: {main_trend.value}")
+                        logger.info(f"   Signal Direction: {signal.direction.value}")
+                        logger.info(f"   ❌ Only trend-following trades allowed in super_scalping")
+                        time.sleep(5)
+                        continue
                 
                 if not signal.is_valid():
                     logger.warning("⚠️ Signal is not valid")
@@ -5871,6 +5892,10 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
 
         super().__init__(symbol, max_lots=max_lots, config=config)
         
+        self.original_symbol = symbol
+        self.market_closed_since = None
+        self.symbol_switched = False
+        
         self.strategy_name = strategy
         if strategy == "day_trading":
             self.strategy_config = StrategyConfig.day_trading()
@@ -5901,6 +5926,13 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
         logger.info(f"   Entry TF: {self.strategy_config.entry_tf}")
         logger.info(f"   Exit Signal TF: {self.strategy_config.exit_signal_tf}")
         logger.info(f"   Exit Confirm TF: {self.strategy_config.exit_confirm_tf}")
+        
+        if not self._is_market_open():
+            logger.warning(f"⚠️ Initial symbol {self.symbol} is closed, checking BTCUSD...")
+            if self._switch_to_bitcoin_at_startup():
+                logger.info(f"✅ Switched to BTCUSD at startup")
+            else:
+                logger.warning(f"⚠️ BTCUSD also not available, keeping {self.symbol}")
     
         self._check_and_set_sltp_for_open_positions()
 
@@ -6132,6 +6164,157 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
 
             return self.nds._calculate_levels_simple(direction, df)
     
+    def _get_main_trend(self) -> TrendDirection:
+        try:
+            df_trend = self.mt5.get_ohlcv(self.strategy_config.trend_tf, 1440)
+            if df_trend is None or len(df_trend) < 10:
+                return TrendDirection.NEUTRAL
+            
+            nodes_trend = self.nds._detect_nodes(df_trend, self.strategy_config.trend_tf)
+            cycles_trend = self.nds._calculate_cycles(nodes_trend)
+            poly_functions = self.nds._fit_polynomial_functions(df_trend)
+            
+            return self.nds._determine_trend(df_trend, cycles_trend, poly_functions)
+        except Exception as e:
+            logger.debug(f"Error getting main trend: {e}")
+            return TrendDirection.NEUTRAL
+    
+    def _is_market_open(self) -> bool:
+        try:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick is None:
+                if not hasattr(self, 'market_closed_since'):
+                    self.market_closed_since = datetime.now()
+                return False
+            
+            symbol_info = mt5.symbol_info(self.symbol)
+            if symbol_info is None:
+                if not hasattr(self, 'market_closed_since'):
+                    self.market_closed_since = datetime.now()
+                return False
+            
+            if not symbol_info.visible or not symbol_info.trade_mode == mt5.SYMBOL_TRADE_MODE_FULL:
+                if not hasattr(self, 'market_closed_since'):
+                    self.market_closed_since = datetime.now()
+                return False
+            
+            current_time = datetime.now()
+            tick_time = datetime.fromtimestamp(tick.time)
+            time_diff = (current_time - tick_time).total_seconds()
+            
+            if time_diff > 300:
+                if not hasattr(self, 'market_closed_since') or self.market_closed_since is None:
+                    self.market_closed_since = datetime.now()
+                return False
+            
+            if hasattr(self, 'market_closed_since'):
+                self.market_closed_since = None
+            
+            return True
+        except Exception as e:
+            logger.debug(f"Error checking market status: {e}")
+            if not hasattr(self, 'market_closed_since'):
+                self.market_closed_since = datetime.now()
+            return False
+    
+    def _switch_to_bitcoin_at_startup(self) -> bool:
+        if self.symbol.upper() == "BTCUSD":
+            logger.info("   Already on BTCUSD")
+            return False
+        
+        old_symbol = self.symbol
+        self.original_symbol = old_symbol
+        
+        try:
+            self.symbol = "BTCUSD"
+            self.mt5.symbol = "BTCUSD"
+            
+            if hasattr(self, 'nds') and hasattr(self.nds, 'mt5'):
+                self.nds.mt5.symbol = "BTCUSD"
+            
+            if hasattr(self, 'trailing_manager'):
+                self.trailing_manager.symbol = "BTCUSD"
+            
+            if hasattr(self, 'point'):
+                self.point = 0.1
+            
+            symbol_info = mt5.symbol_info("BTCUSD")
+            if symbol_info and symbol_info.visible:
+                if self._is_market_open():
+                    logger.info(f"✅ Switched from {old_symbol} to BTCUSD at startup")
+                    logger.info(f"   BTCUSD market status: OPEN")
+                    self.symbol_switched = True
+                    self.market_closed_since = None
+                    return True
+                else:
+                    logger.warning(f"⚠️ BTCUSD is also closed, reverting to {old_symbol}")
+                    self.symbol = old_symbol
+                    self.mt5.symbol = old_symbol
+                    return False
+            else:
+                logger.error(f"❌ BTCUSD not available, reverting to {old_symbol}")
+                self.symbol = old_symbol
+                self.mt5.symbol = old_symbol
+                return False
+        except Exception as e:
+            logger.error(f"❌ Error switching to BTCUSD at startup: {e}")
+            self.symbol = old_symbol
+            self.mt5.symbol = old_symbol
+            return False
+    
+    def _switch_to_bitcoin_if_market_closed(self) -> bool:
+        if not hasattr(self, 'market_closed_since') or self.market_closed_since is None:
+            return False
+        
+        if hasattr(self, 'symbol_switched') and self.symbol_switched:
+            return True
+        
+        current_time = datetime.now()
+        closed_duration = (current_time - self.market_closed_since).total_seconds()
+        
+        if closed_duration > 7200:
+            logger.warning(f"⚠️ Market closed for {closed_duration/3600:.1f} hours, switching to BTCUSD")
+            
+            if self.symbol.upper() == "BTCUSD":
+                logger.info("   Already on BTCUSD, no switch needed")
+                return False
+            
+            old_symbol = self.symbol
+            self.original_symbol = old_symbol
+            
+            try:
+                self.symbol = "BTCUSD"
+                self.mt5.symbol = "BTCUSD"
+                
+                if hasattr(self, 'nds') and hasattr(self.nds, 'mt5'):
+                    self.nds.mt5.symbol = "BTCUSD"
+                
+                if hasattr(self, 'trailing_manager'):
+                    self.trailing_manager.symbol = "BTCUSD"
+                
+                if hasattr(self, 'point'):
+                    self.point = 0.1
+                
+                symbol_info = mt5.symbol_info("BTCUSD")
+                if symbol_info and symbol_info.visible:
+                    logger.info(f"✅ Switched from {old_symbol} to BTCUSD")
+                    logger.info(f"   BTCUSD market status: {'OPEN' if self._is_market_open() else 'CLOSED'}")
+                    self.symbol_switched = True
+                    self.market_closed_since = None
+                    return True
+                else:
+                    logger.error(f"❌ BTCUSD not available, reverting to {old_symbol}")
+                    self.symbol = old_symbol
+                    self.mt5.symbol = old_symbol
+                    return False
+            except Exception as e:
+                logger.error(f"❌ Error switching to BTCUSD: {e}")
+                self.symbol = old_symbol
+                self.mt5.symbol = old_symbol
+                return False
+        
+        return False
+    
     def _check_exit_signal(self) -> bool:
 
         try:
@@ -6272,6 +6455,14 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
                     time.sleep(1)
                     continue
                 
+                if not self._is_market_open():
+                    if self._switch_to_bitcoin_if_market_closed():
+                        logger.info("🔄 Switched to BTCUSD, continuing analysis...")
+                        continue
+                    logger.debug("⏸️ Market is closed, skipping analysis")
+                    time.sleep(30)
+                    continue
+                
                 logger.info("🔍 Analyzing for new trade...")
                 
                 if hasattr(self.nds, 'optimized_analyze'):
@@ -6293,6 +6484,16 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
                 logger.info(f"   TP: {signal.take_profit:.2f}")
                 logger.info(f"   Confidence: {signal.confidence:.2%}")
                 logger.info(f"   R/R: {signal.risk_reward:.2f}")
+                
+                if self.strategy_name == "super_scalping":
+                    main_trend = self._get_main_trend()
+                    if main_trend != TrendDirection.NEUTRAL and signal.direction != main_trend:
+                        logger.warning(f"⚠️ Counter-trend trade rejected for super_scalping")
+                        logger.info(f"   Main Trend: {main_trend.value}")
+                        logger.info(f"   Signal Direction: {signal.direction.value}")
+                        logger.info(f"   ❌ Only trend-following trades allowed in super_scalping")
+                        time.sleep(5)
+                        continue
                 
                 if not signal.is_valid():
                     logger.warning("⚠️ Signal is not valid")
@@ -6750,7 +6951,7 @@ class NodeBasedTrailingManager:
         self.current_strategy = 'normal'
         
         self.scalp_mode = True
-        self.max_trades_per_hour = 10
+        self.max_trades_per_hour = 1000
         self.trades_this_hour = 0
         self.hour_start = datetime.now()
 
@@ -7675,7 +7876,7 @@ def main():
 
             logger.info("🚀 Starting Super Scalping Bot...")
             logger.info(f"   Symbol: {selected_symbol} ({selected_display})")
-            logger.info(f"   Strategy: Super Scalping (M5/M3/M1)")
+            logger.info(f"   Strategy: Super Scalping (M3/M1/M1)")
             max_lots = config.max_lots if config else 0.3
             bot = UnifiedTradingBot(
                 symbol=selected_symbol, 
