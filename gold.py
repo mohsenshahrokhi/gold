@@ -2668,6 +2668,7 @@ class RLPolicyOptimizer:
 
         self.trade_count = 0
         self.optimization_interval = 5
+        self.max_buffer_size = 200
 
         self.parameter_history = []
 
@@ -2686,6 +2687,10 @@ class RLPolicyOptimizer:
         self.buffer['rewards'].append(reward)
         self.buffer['values'].append(value)
         self.buffer['dones'].append(done)
+
+        if len(self.buffer['states']) > self.max_buffer_size:
+            for key in self.buffer.keys():
+                self.buffer[key] = self.buffer[key][-self.max_buffer_size:]
 
         self.trade_count += 1
 
