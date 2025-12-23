@@ -208,12 +208,19 @@ class TelegramNotifier:
         self.last_trade_info = None
         
         if self.enabled:
-            logger.info("✅ Telegram notifications enabled")
+            logger.info(f"✅ Telegram notifications enabled")
+            logger.info(f"   Bot token: {self.bot_token[:10]}...")
+            logger.info(f"   Chat ID: {self.chat_id}")
         else:
-            logger.info("⚠️ Telegram notifications disabled (no token/chat_id)")
+            logger.warning("⚠️ Telegram notifications disabled")
+            if not bot_token:
+                logger.warning("   ❌ TELEGRAM_BOT_TOKEN not set")
+            if not chat_id:
+                logger.warning("   ❌ TELEGRAM_CHAT_ID not set")
     
     def send_message(self, message: str, parse_mode: str = "HTML"):
         if not self.enabled:
+            logger.debug("Telegram disabled, skipping message")
             return
         
         try:
@@ -230,17 +237,27 @@ class TelegramNotifier:
                 "text": message,
                 "parse_mode": parse_mode
             }
-            response = requests.post(url, json=data, timeout=5)
-            if response.status_code != 200:
+            logger.debug(f"Sending Telegram message to {chat_id}")
+            response = requests.post(url, json=data, timeout=10)
+            if response.status_code == 200:
+                logger.info(f"✅ Telegram message sent successfully")
+            else:
                 error_data = response.json() if response.content else {}
-                logger.error(f"Telegram send failed: {response.status_code} - {error_data.get('description', 'Unknown error')}")
+                error_desc = error_data.get('description', 'Unknown error')
+                logger.error(f"❌ Telegram send failed: {response.status_code} - {error_desc}")
+                logger.error(f"   Bot token: {self.bot_token[:10]}...")
+                logger.error(f"   Chat ID: {chat_id}")
         except Exception as e:
-            logger.error(f"Error sending Telegram message: {e}")
+            logger.error(f"❌ Error sending Telegram message: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def notify_trade_opened(self, ticket: int, direction: str, entry: float, sl: float, tp: float, volume: float):
         if not self.enabled:
+            logger.debug("Telegram disabled, skipping trade opened notification")
             return
         
+        logger.info(f"📤 Sending Telegram notification: Trade #{ticket} opened")
         emoji = "📈" if direction == "BUY" else "📉"
         message = f"""
 {emoji} <b>NEW TRADE OPENED</b>
@@ -266,8 +283,10 @@ class TelegramNotifier:
     
     def notify_trailing_stop(self, ticket: int, old_sl: float, new_sl: float, reason: str = ""):
         if not self.enabled:
+            logger.debug("Telegram disabled, skipping trailing stop notification")
             return
         
+        logger.info(f"📤 Sending Telegram notification: Trailing stop for trade #{ticket}")
         message = f"""
 🔄 <b>TRAILING STOP UPDATED</b>
 
@@ -283,8 +302,10 @@ class TelegramNotifier:
     
     def notify_trade_closed(self, ticket: int, profit: float, reason: str = ""):
         if not self.enabled:
+            logger.debug("Telegram disabled, skipping trade closed notification")
             return
         
+        logger.info(f"📤 Sending Telegram notification: Trade #{ticket} closed")
         self.total_trades += 1
         self.total_profit += profit
         
@@ -857,12 +878,12 @@ class TradeManager:
                 sl_distance = abs(signal.stop_loss - entry_price)
 
             spread = self.mt5.get_spread()
-            min_sl_distance = 3 * spread
+            min_sl_distance = 2 * spread
 
             if sl_distance < min_sl_distance:
                 logger.warning(f"⚠️ SL too close to entry - rejecting trade")
                 logger.info(f"   SL Distance: {sl_distance:.2f} points")
-                logger.info(f"   Minimum Required: {min_sl_distance:.2f} points (3x spread)")
+                logger.info(f"   Minimum Required: {min_sl_distance:.2f} points (2x spread)")
                 logger.info(f"   Spread: {spread:.2f} points")
                 logger.info(f"   Entry: {entry_price:.2f}, SL: {signal.stop_loss:.2f}")
                 logger.info(f"   ❌ Trade rejected to avoid high-risk small cycle trades")
@@ -1273,6 +1294,7 @@ class TradeManager:
             10018: "Invalid account",
             10019: "Trade timeout",
             10020: "Invalid trade parameters",
+            10025: "Price too close or invalid",
         }
         
         if retcode in error_map:
@@ -1587,7 +1609,8 @@ class AdvancedGoldenmanAnalyzer:
                 return None
 
             risk_reward = abs(tp - entry_price) / abs(entry_price - sl)
-            logger.info(f"   Entry: {entry_price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+            spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
+            logger.info(f"   Entry: {entry_price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}, Spread={spread:.2f}")
             logger.info(f"   Calculated R/R: {risk_reward:.2f}")
             if risk_reward < 1.5:
                 logger.info(f"R/R ({risk_reward:.2f}) below 1.5 - waiting for better position")
@@ -2065,7 +2088,7 @@ class AdvancedGoldenmanAnalyzer:
                 if tp <= entry:
                     tp = entry * 1.01 - safety_margin
                 
-                logger.info(f"   BUY: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}")
+                logger.info(f"   BUY: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, Spread={spread:.2f}")
             
             elif direction == TrendDirection.BEARISH:
                 entry = current_price
@@ -2077,7 +2100,7 @@ class AdvancedGoldenmanAnalyzer:
                 if tp >= entry:
                     tp = entry * 0.99 + safety_margin
                 
-                logger.info(f"   SELL: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}")
+                logger.info(f"   SELL: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, Spread={spread:.2f}")
             
             else:
                 return 0.0, 0.0, 0.0
@@ -2835,7 +2858,7 @@ class RLPolicyOptimizer:
         if len(self.buffer['states']) > self.max_buffer_size:
             for key in self.buffer.keys():
                 self.buffer[key] = self.buffer[key][-self.max_buffer_size:]
-
+        
         self.trade_count += 1
         
         if self.trade_count >= self.optimization_interval:
@@ -5112,7 +5135,38 @@ class ImprovedNodeBasedTrailing:
             
             pos = positions[0]
             
-            if abs(pos.sl - state['current_sl']) > 0.01 or abs(pos.tp - state['current_tp']) > 0.01:
+            sl_diff = abs(pos.sl - state['current_sl'])
+            tp_diff = abs(pos.tp - state['current_tp'])
+            
+            tolerance = 0.1
+            
+            if sl_diff > tolerance or tp_diff > tolerance:
+                state_sl_tp_diff = abs(state['current_sl'] - state['current_tp'])
+                if state_sl_tp_diff < 0.01:
+                    logger.warning(f"⚠️ Invalid SL/TP values in trade state for #{ticket} (SL=TP={state['current_sl']:.2f})")
+                    logger.info(f"   Current position SL: {pos.sl:.2f}, TP: {pos.tp:.2f}")
+                    
+                    if pos.sl > 0 and pos.tp > 0 and abs(pos.sl - pos.tp) > 0.01:
+                        state['current_sl'] = pos.sl
+                        state['current_tp'] = pos.tp
+                        logger.info(f"   ✅ Updated trade state with current SL/TP values")
+                        return
+                    elif abs(pos.sl) < 0.01 and abs(pos.tp) < 0.01:
+                        logger.warning(f"   ⚠️ Position has no SL/TP and state is invalid - removing invalid state")
+                        logger.info(f"   🔄 Will re-initialize when SL/TP is set")
+                        del self.trade_states[ticket]
+                        return
+                    else:
+                        logger.warning(f"   ⚠️ Skipping restore - invalid state values")
+                        return
+                
+                if not hasattr(state, '_restore_attempted'):
+                    state['_restore_attempted'] = 0
+                
+                if state.get('_restore_attempted', 0) >= 3:
+                    logger.warning(f"⚠️ Skipping SL/TP restore for trade #{ticket} - too many failed attempts")
+                    return
+                
                 logger.warning(f"⚠️ SL/TP manually changed for trade #{ticket}")
                 logger.info(f"   Expected SL: {state['current_sl']:.2f}, Current SL: {pos.sl:.2f}")
                 logger.info(f"   Expected TP: {state['current_tp']:.2f}, Current TP: {pos.tp:.2f}")
@@ -5129,8 +5183,19 @@ class ImprovedNodeBasedTrailing:
                 result = mt5.order_send(request)
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                     logger.info(f"   ✅ SL/TP restored to original values")
+                    state['_restore_attempted'] = 0
                 else:
-                    logger.error(f"   ❌ Failed to restore SL/TP: {result.retcode if result else 'None'}")
+                    state['_restore_attempted'] = state.get('_restore_attempted', 0) + 1
+                    error_code = result.retcode if result else 'None'
+                    logger.error(f"   ❌ Failed to restore SL/TP: {error_code} (Attempt {state['_restore_attempted']}/3)")
+                    if error_code == 10016:
+                        logger.error(f"   💡 AutoTrading is disabled in MT5. Press Ctrl+T to enable.")
+                    elif error_code == 10025 or error_code == 10005:
+                        logger.warning(f"   ⚠️ Price too close or invalid - updating state with current values")
+                        state['current_sl'] = pos.sl
+                        state['current_tp'] = pos.tp
+                        state['_restore_attempted'] = 0
+                        logger.info(f"   ✅ State updated with current SL/TP values")
                 return
 
             tick = mt5.symbol_info_tick(self.symbol)
@@ -5155,6 +5220,7 @@ class ImprovedNodeBasedTrailing:
                         f"Volume: {pos.volume:.3f} | Price: {current_price:.2f}")
             
             if not state['stage_10pct'] and progress_pct >= 10:
+                state['stage_10pct'] = True
                 logger.info(f"🔹 STAGE 1: 10% crossed")
                 
                 last_node = self.get_last_node_below(state['entry_price'], 
@@ -5167,10 +5233,12 @@ class ImprovedNodeBasedTrailing:
                     new_sl = last_node + safety_margin
                 
                 if self.update_sl(ticket, new_sl, "10% - Last node below entry"):
-                    state['stage_10pct'] = True
                     logger.info(f"   → SL to {new_sl:.2f} (node @ {last_node:.2f})")
+                else:
+                    logger.warning(f"   ⚠️ Failed to update SL to node")
             
             if not state['stage_15pct'] and progress_pct >= 15:
+                state['stage_15pct'] = True
                 logger.info(f"🔹 STAGE 2: 15% crossed - BREAKEVEN")
                 
                 spread_pips = state['spread']
@@ -5182,16 +5250,17 @@ class ImprovedNodeBasedTrailing:
                     new_sl = state['entry_price'] - (spread_pips * self.point) - (commission_pips * self.point)
                 
                 if self.update_sl(ticket, new_sl, "15% - Breakeven + Spread + Comm"):
-                    state['stage_15pct'] = True
                     logger.info(f"   → SL to {new_sl:.2f} (BE + {spread_pips:.0f}p spread + {commission_pips:.1f}p comm)")
+                else:
+                    logger.warning(f"   ⚠️ Failed to update SL to breakeven")
             
             if not state['stage_50pct'] and progress_pct >= 50:
+                state['stage_50pct'] = True
                 logger.info(f"🔹 STAGE 3: 50% reached")
                 
                 close_vol = state['initial_volume'] * 0.50
                 
                 if self.partial_close(ticket, close_vol, "50%_profit"):
-                    state['stage_50pct'] = True
                     
                     nearest_node = self.get_nearest_node_below_market(
                         current_price,
@@ -5208,13 +5277,13 @@ class ImprovedNodeBasedTrailing:
                     logger.info(f"   → 50% closed | SL to {new_sl:.2f} (node @ {nearest_node:.2f})")
             
             if not state['stage_70pct'] and progress_pct >= 70:
+                state['stage_70pct'] = True
                 logger.info(f"🔹 STAGE 4: 70% reached")
                 
                 remaining_volume = state['initial_volume'] - state['total_closed_volume']
                 close_vol = remaining_volume * 0.30
                 
                 if self.partial_close(ticket, close_vol, "70%_profit"):
-                    state['stage_70pct'] = True
                     
                     nearest_node = self.get_nearest_node_below_market(
                         current_price,
@@ -5411,27 +5480,81 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             
             if not nodes:
                 logger.warning("⚠️ No nodes detected!")
-                nodes = []
+                nodes = {'below_entry': [], 'above_entry': [], 'all': []}
             
-            default_sl = pos.sl if pos.sl > 0 else (
-                pos.price_open - (100 * self.point) if pos.type == mt5.ORDER_TYPE_BUY 
-                else pos.price_open + (100 * self.point)
-            )
+            if pos.sl > 0 and pos.tp > 0:
+                sl_price = pos.sl
+                tp_price = pos.tp
+            else:
+                direction = TrendDirection.BULLISH if pos.type == mt5.ORDER_TYPE_BUY else TrendDirection.BEARISH
+                df = self.mt5.get_ohlcv(self.strategy_config.entry_tf, 50)
+                
+                if df is not None and len(df) >= 10:
+                    entry, sl, tp = self._calculate_levels_strategy_based(direction, df)
+                    
+                    if entry > 0 and sl > 0 and tp > 0:
+                        current_price = df['close'].values[-1]
+                        
+                        if pos.type == mt5.ORDER_TYPE_BUY:
+                            sl_distance = entry - sl
+                            tp_distance = tp - entry
+                            sl_price = pos.price_open - sl_distance
+                            tp_price = pos.price_open + tp_distance
+                        else:
+                            sl_distance = sl - entry
+                            tp_distance = entry - tp
+                            sl_price = pos.price_open + sl_distance
+                            tp_price = pos.price_open - tp_distance
+                        
+                        point = self.mt5.get_point() if hasattr(self.mt5, 'get_point') else (getattr(self, 'point', 0.1))
+                        
+                        if abs(sl_price - tp_price) < 0.01:
+                            logger.warning(f"⚠️ Calculated SL/TP too close, using defaults")
+                            sl_price = pos.sl if pos.sl > 0 else (
+                                pos.price_open - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                                else pos.price_open + (100 * point)
+                            )
+                            tp_price = pos.tp if pos.tp > 0 else (
+                                pos.price_open + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                                else pos.price_open - (150 * point)
+                            )
+                    else:
+                        logger.warning(f"⚠️ Could not calculate SL/TP, using defaults")
+                        point = self.mt5.get_point() if hasattr(self.mt5, 'get_point') else (getattr(self, 'point', 0.1))
+                        sl_price = pos.sl if pos.sl > 0 else (
+                            pos.price_open - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                            else pos.price_open + (100 * point)
+                        )
+                        tp_price = pos.tp if pos.tp > 0 else (
+                            pos.price_open + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                            else pos.price_open - (150 * point)
+                        )
+                else:
+                    logger.warning(f"⚠️ Cannot get price data, using defaults")
+                    point = self.mt5.get_point() if hasattr(self.mt5, 'get_point') else (getattr(self, 'point', 0.1))
+                    sl_price = pos.sl if pos.sl > 0 else (
+                        pos.price_open - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                        else pos.price_open + (100 * point)
+                    )
+                    tp_price = pos.tp if pos.tp > 0 else (
+                        pos.price_open + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                        else pos.price_open - (150 * point)
+                    )
             
-            default_tp = pos.tp if pos.tp > 0 else (
-                pos.price_open + (150 * self.point) if pos.type == mt5.ORDER_TYPE_BUY 
-                else pos.price_open - (150 * self.point)
-            )
+            if abs(sl_price - tp_price) < 0.01:
+                logger.error(f"❌ Invalid SL/TP values: SL={sl_price:.2f}, TP={tp_price:.2f} (too close or equal)")
+                logger.error(f"   Entry price: {pos.price_open:.2f}")
+                return False
             
             self.trailing_manager.initialize_trade_state(
                 ticket=ticket,
                 entry_price=pos.price_open,
-                sl=default_sl,
-                tp=default_tp,
+                sl=sl_price,
+                tp=tp_price,
                 volume=pos.volume,
                 direction="BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL",
                 nodes=nodes,
-                spread=5.0,
+                spread=self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 5.0,
                 commission=0.5
             )
             
@@ -5845,8 +5968,32 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
                             else:
                                 tp_price = position.tp
 
+                        if abs(sl_price - tp_price) < 0.01:
+                            logger.error(f"   ❌ Invalid SL/TP values: SL={sl_price:.2f}, TP={tp_price:.2f} (too close or equal)")
+                            logger.error(f"   Calculated entry={entry:.2f}, sl={sl:.2f}, tp={tp:.2f}")
+                            logger.error(f"   Entry price={entry_price:.2f}, sl_distance={sl_distance:.2f}, tp_distance={tp_distance:.2f}")
+                            continue
+                        
                         logger.info(f"   🔧 Setting SL={sl_price:.2f}, TP={tp_price:.2f} for position #{position.ticket}")
-                        self._set_position_sltp(position.ticket, sl_price, tp_price)
+                        success = self._set_position_sltp(position.ticket, sl_price, tp_price)
+                        
+                        if success and hasattr(self, 'trailing_manager'):
+                            try:
+                                nodes = self.trailing_manager.detect_nodes()
+                                self.trailing_manager.initialize_trade_state(
+                                    ticket=position.ticket,
+                                    entry_price=entry_price,
+                                    sl=sl_price,
+                                    tp=tp_price,
+                                    volume=position.volume,
+                                    direction='BUY' if position.type == mt5.ORDER_TYPE_BUY else 'SELL',
+                                    nodes=nodes,
+                                    spread=self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0.0,
+                                    commission=0.0
+                                )
+                                logger.info(f"   ✅ Trade state initialized for position #{position.ticket}")
+                            except Exception as e:
+                                logger.warning(f"   ⚠️ Could not initialize trade state: {e}")
                     else:
                         logger.warning(f"   ⚠️ Could not calculate valid SL/TP for position #{position.ticket}")
                 else:
@@ -5886,6 +6033,7 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
                 if updated_positions:
                     updated = updated_positions[0]
                     logger.info(f"   ✅ Confirmed: SL={updated.sl:.2f}, TP={updated.tp:.2f}")
+                return True
             else:
                 logger.warning(f"   ⚠️ Failed to set SL/TP for position #{ticket}")
                 if result:
@@ -5893,13 +6041,15 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
 
                 logger.info(f"   🔄 Trying alternative method...")
                 if hasattr(self.mt5, '_modify_position_sltp'):
-                    self.mt5._modify_position_sltp(position, sl_price, tp_price)
+                    success = self.mt5._modify_position_sltp(position, sl_price, tp_price)
+                    return success
                 else:
                     logger.warning(f"   ⚠️ Alternative method not available")
+                    return False
 
         except Exception as e:
             logger.error(f"   ❌ Error setting SL/TP for position #{ticket}: {e}")
-
+    
     def _calculate_levels_strategy_based(self, direction: TrendDirection, df: pd.DataFrame) -> Tuple[float, float, float]:
 
         try:
@@ -5942,13 +6092,15 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
 
                     tp = entry + (abs(entry - sl) * min_rr) - safety_margin
                     logger.info(f"   Adjusted TP to maintain R/R >= {min_rr}")
+                    rr = abs(tp - entry) / abs(entry - sl)
                 
                 if sl >= entry:
                     sl = entry * 0.995 - safety_margin
                 if tp <= entry:
                     tp = entry * 1.01 - safety_margin
                 
-                logger.info(f"   BUY: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, R/R={rr:.2f}")
+                rr = abs(tp - entry) / abs(entry - sl)
+                logger.info(f"   BUY: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, R/R={rr:.2f}, Spread={spread:.2f}")
             
             elif direction == TrendDirection.BEARISH:
                 entry = current_price
@@ -5960,13 +6112,15 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
 
                     tp = entry - (abs(sl - entry) * min_rr) + safety_margin
                     logger.info(f"   Adjusted TP to maintain R/R >= {min_rr}")
+                    rr = abs(entry - tp) / abs(sl - entry)
                 
                 if sl <= entry:
                     sl = entry * 1.005 + safety_margin
                 if tp >= entry:
                     tp = entry * 0.99 + safety_margin
                 
-                logger.info(f"   SELL: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, R/R={rr:.2f}")
+                rr = abs(entry - tp) / abs(sl - entry)
+                logger.info(f"   SELL: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, R/R={rr:.2f}, Spread={spread:.2f}")
             
             else:
                 return 0.0, 0.0, 0.0
@@ -6049,7 +6203,7 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
 
                     if hasattr(self, '_exit_signal_logged') and pos.ticket in self._exit_signal_logged:
                         del self._exit_signal_logged[pos.ticket]
-                        logger.debug(f"Exit signal cleared for trade #{pos.ticket} - trend returned to {trade_signal}")
+                        logger.debug(f"Exit signal cleared for trade #{pos.ticket} - trend returned to {trend_signal}")
             
             return False
             
@@ -6189,10 +6343,10 @@ class NodeBasedTrailingManager:
         self.trade_states = {}
         
         self.profit_levels = {
-            20: {'close_percent': 5, 'description': 'اولین سیو'},
-            50: {'close_percent': 50, 'description': 'نصف باقیمانده'},
-            70: {'close_percent': 50, 'description': 'نصف از 50% باقی'},
-            85: {'close_percent': 75, 'description': 'سیو 75% کل'}
+            20: {'close_percent': 5, 'description': 'First save'},
+            50: {'close_percent': 50, 'description': 'Half remaining'},
+            70: {'close_percent': 50, 'description': 'Half of 50% remaining'},
+            85: {'close_percent': 75, 'description': 'Save 75% total'}
         }
         
     def initialize_trade_state(self, ticket: int, entry_price: float, 
@@ -7289,7 +7443,7 @@ def main():
     }
     
     print("\n" + "=" * 60)
-    print("📊 SELECT SYMBOL (نماد معاملاتی)")
+    print("📊 SELECT SYMBOL")
     print("=" * 60)
     
     if not symbol_menu:
@@ -7398,19 +7552,19 @@ def main():
             return
     
     print("\n" + "=" * 60)
-    print("🤖 SELECT STRATEGY (استراتژی معاملاتی)")
+    print("🤖 SELECT STRATEGY")
     print("=" * 60)
-    print("1. 📈 Day Strategy (استراتژی روزانه)")
+    print("1. 📈 Day Strategy")
     print("   - Trend: H1 | Coarse: M15 | Fine: M3 | Entry: M1")
     print("   - Exit Signal: M5 | Exit Confirm: M3")
     print("   - Best for: Swing analysis, longer positions")
     print()
-    print("2. ⚡ Scalping (اسکلپینگ)")
+    print("2. ⚡ Scalping")
     print("   - Trend: M15 | Coarse: M5 | Fine: M3 | Entry: M1")
     print("   - Exit Signal: M3 | Exit Confirm: M1")
     print("   - Best for: Active analysis, quick profits")
     print()
-    print("3. 🚀 Super Scalping (سوپر اسکلپینگ)")
+    print("3. 🚀 Super Scalping")
     print("   - Trend: M5 | Coarse: M3 | Fine: M1 | Entry: M1")
     print("   - Exit Signal: M3 | Exit Confirm: M1")
     print("   - Best for: High frequency analysis, ultra-fast execution")
