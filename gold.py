@@ -4692,6 +4692,8 @@ class ImprovedNodeBasedTrailing:
         'entry_price': entry_price,
         'initial_sl': sl,
         'initial_tp': tp,
+        'current_sl': sl,
+        'current_tp': tp,
         'initial_volume': volume,
         'current_volume': volume,
         'direction': direction,
@@ -4890,6 +4892,8 @@ class ImprovedNodeBasedTrailing:
 
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 logger.info(f"✅ SL UPDATED: {new_sl:.2f} | {reason}")
+                if ticket in self.trade_states:
+                    self.trade_states[ticket]['current_sl'] = new_sl
                 return True
             else:
                 logger.debug(f"❌ SL update failed: {result.retcode if result else 'None'}")
@@ -4915,6 +4919,27 @@ class ImprovedNodeBasedTrailing:
                 return
 
             pos = positions[0]
+
+            if abs(pos.sl - state['current_sl']) > 0.01 or abs(pos.tp - state['current_tp']) > 0.01:
+                logger.warning(f"⚠️ SL/TP manually changed for trade #{ticket}")
+                logger.info(f"   Expected SL: {state['current_sl']:.2f}, Current SL: {pos.sl:.2f}")
+                logger.info(f"   Expected TP: {state['current_tp']:.2f}, Current TP: {pos.tp:.2f}")
+                logger.info(f"   🔄 Restoring to original values...")
+                
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "symbol": self.symbol,
+                    "position": ticket,
+                    "sl": state['current_sl'],
+                    "tp": state['current_tp'],
+                }
+                
+                result = mt5.order_send(request)
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logger.info(f"   ✅ SL/TP restored to original values")
+                else:
+                    logger.error(f"   ❌ Failed to restore SL/TP: {result.retcode if result else 'None'}")
+                return
 
             tick = mt5.symbol_info_tick(self.symbol)
             if not tick:
