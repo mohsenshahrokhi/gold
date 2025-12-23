@@ -218,14 +218,22 @@ class TelegramNotifier:
         
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            
+            chat_id = self.chat_id
+            if chat_id.startswith('@'):
+                chat_id = chat_id
+            elif not chat_id.startswith('-') and not chat_id.isdigit():
+                chat_id = f"@{chat_id}"
+            
             data = {
-                "chat_id": self.chat_id,
+                "chat_id": chat_id,
                 "text": message,
                 "parse_mode": parse_mode
             }
             response = requests.post(url, json=data, timeout=5)
             if response.status_code != 200:
-                logger.error(f"Telegram send failed: {response.status_code}")
+                error_data = response.json() if response.content else {}
+                logger.error(f"Telegram send failed: {response.status_code} - {error_data.get('description', 'Unknown error')}")
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
     
