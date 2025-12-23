@@ -1,0 +1,38 @@
+{
+  "symbol": "BTCUSD",
+  "max_lots": 0.3,
+  "risk": {
+    "max_risk_percent": 0.5,
+    "max_lots": 0.3,
+    "min_balance": 500.0,
+    "max_daily_loss": 0.02,
+    "max_daily_trades": 10
+  },
+  "trading": {
+    "magic_number": 123456,
+    "pip_margin": 5,
+    "min_volume": 0.01,
+    "max_volume": 0.5,
+    "spread_margin": 5.0,
+    "commission": 0.0
+  },
+  "scalping": {
+    "max_trades_per_hour": 10,
+    "target_pips": 10,
+    "max_risk_pips": 5,
+    "min_confidence": 0.7,
+    "fixed_volume": 0.1
+  },
+  "nds": {
+    "alpha_correction": 0.86,
+    "alpha_pressure": 0.2,
+    "beta_displacement": 0.3,
+    "tf_trend": 3,
+    "tf_analysis": 1,
+    "tf_entry": 1
+  },
+  "log_level": "INFO",
+  "log_file": null,
+  "cache_enabled": true,
+  "cache_ttl": 60
+}
