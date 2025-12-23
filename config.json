@@ -34,5 +34,9 @@
   "log_level": "INFO",
   "log_file": null,
   "cache_enabled": true,
-  "cache_ttl": 60
+  "cache_ttl": 60,
+  "telegram": {
+    "bot_token": null,
+    "chat_id": null
+  }
 }

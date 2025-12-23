@@ -69,6 +69,10 @@ class BotConfig:
     cache_enabled: bool = True
     cache_ttl: int = 60
     
+    # Telegram
+    telegram_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    
     @classmethod
     def from_file(cls, path: str) -> 'BotConfig':
         """بارگذاری تنظیمات از فایل JSON"""
