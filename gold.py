@@ -1,13 +1,13 @@
 """
 ===============================================================================
-🤖 ENHANCED NDS TRADING BOT - COMPLETE IMPLEMENTATION
+🤖 GOLDENMAN - COMPLETE IMPLEMENTATION
 ===============================================================================
-📌 Complete NDS paper implementation with Fractal, Symmetry, and Neural Network
+📌 Complete analysis system with Fractal, Symmetry, and Neural Network
 📌 Ready for MetaTrader 5 connection
 
-Author: Enhanced NDS System
+Author: Goldenman System
 Date: 1404/09/30
-Version: 2.0.0 - Complete Paper Implementation
+Version: 2.0.0 - Complete Implementation
 ===============================================================================
 """
 
