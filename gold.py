@@ -4854,10 +4854,11 @@ class StrategyConfig:
 
 class ImprovedNodeBasedTrailing:
 
-    def __init__(self, mt5_manager, symbol="BTCUSD"):
+    def __init__(self, mt5_manager, symbol="BTCUSD", bot_instance=None):
         self.mt5 = mt5_manager
         self.symbol = symbol
         self.point = 0.1
+        self.bot_instance = bot_instance
 
         self.trade_states = {}
 
