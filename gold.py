@@ -727,12 +727,29 @@ class TradeManager:
                 order_type = mt5.ORDER_TYPE_BUY
                 price = tick.ask
                 direction_str = "BUY"
+                entry_price = price
+                sl_distance = abs(entry_price - signal.stop_loss)
             else:
                 order_type = mt5.ORDER_TYPE_SELL
                 price = tick.bid
                 direction_str = "SELL"
+                entry_price = price
+                sl_distance = abs(signal.stop_loss - entry_price)
+
+            spread = self.mt5.get_spread()
+            min_sl_distance = 3 * spread
+
+            if sl_distance < min_sl_distance:
+                logger.warning(f"⚠️ SL too close to entry - rejecting trade")
+                logger.info(f"   SL Distance: {sl_distance:.2f} points")
+                logger.info(f"   Minimum Required: {min_sl_distance:.2f} points (3x spread)")
+                logger.info(f"   Spread: {spread:.2f} points")
+                logger.info(f"   Entry: {entry_price:.2f}, SL: {signal.stop_loss:.2f}")
+                logger.info(f"   ❌ Trade rejected to avoid high-risk small cycle trades")
+                return None
 
             logger.info(f"📝 Order: {direction_str} {volume} lots @ {price:.2f}")
+            logger.info(f"   SL Distance: {sl_distance:.2f} points (OK, >= {min_sl_distance:.2f})")
 
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
