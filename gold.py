@@ -1354,17 +1354,54 @@ class AdvancedGoldenmanAnalyzer:
 
         self.nodes_cache: Dict[int, List[Node]] = {}
         self.cycles_cache: Dict[int, List[Cycle]] = {}
+        self.dataframe_cache: Dict[int, pd.DataFrame] = {}
+        self.last_candle_time_cache: Dict[int, datetime] = {}
 
         self.scalp_target_pips = 10
         self.scalp_max_risk_pips = 5
         self.min_scalp_confidence = 0.7
+
+    def _should_update_timeframe(self, timeframe: int) -> bool:
+        if timeframe == mt5.TIMEFRAME_M1:
+            return True
+        
+        df = self.mt5.get_ohlcv(timeframe, 2)
+        if df is None or len(df) < 2:
+            return True
+        
+        current_candle_time = df.index[-1]
+        last_time = self.last_candle_time_cache.get(timeframe)
+        
+        if last_time is None or current_candle_time > last_time:
+            self.last_candle_time_cache[timeframe] = current_candle_time
+            return True
+        
+        return False
+
+    def _get_cached_or_fresh_data(self, timeframe: int, count: int) -> Optional[pd.DataFrame]:
+        if timeframe == mt5.TIMEFRAME_M1:
+            return self.mt5.get_ohlcv(timeframe, count)
+        
+        if self._should_update_timeframe(timeframe):
+            df = self.mt5.get_ohlcv(timeframe, count)
+            if df is not None:
+                self.dataframe_cache[timeframe] = df
+            return df
+        else:
+            cached_df = self.dataframe_cache.get(timeframe)
+            if cached_df is not None:
+                return cached_df
+            df = self.mt5.get_ohlcv(timeframe, count)
+            if df is not None:
+                self.dataframe_cache[timeframe] = df
+            return df
 
     def analyze(self) -> Optional[GoldenmanSignal]:
 
         try:
             logger.info("Starting Goldenman analysis...")
 
-            df_trend = self.mt5.get_ohlcv(self.tf_trend, 1440)
+            df_trend = self._get_cached_or_fresh_data(self.tf_trend, 1440)
             df_analysis = self.mt5.get_ohlcv(self.tf_analysis, 500)
             df_entry = self.mt5.get_ohlcv(self.tf_entry, 200)
 
@@ -3667,7 +3704,7 @@ class EnhancedGoldenmanAnalyzer(AdvancedGoldenmanAnalyzer):
         try:
             logger.info("🚀 Starting Enhanced Goldenman Analysis...")
 
-            df_trend = self.mt5.get_ohlcv(self.tf_trend, 2000)
+            df_trend = self._get_cached_or_fresh_data(self.tf_trend, 2000)
             df_analysis = self.mt5.get_ohlcv(self.tf_analysis, 1000)
 
             if df_trend is None or df_analysis is None:
@@ -4469,8 +4506,8 @@ class OptimizedGoldenmanAnalyzer(EnhancedGoldenmanAnalyzer):
 
             self.cache_stats['misses'] += 1
 
-            df_trend = self._optimized_data_loading(self.tf_trend, 1440)
-            df_analysis = self._optimized_data_loading(self.tf_analysis, 500)
+            df_trend = self._get_cached_or_fresh_data(self.tf_trend, 1440) if hasattr(self, '_get_cached_or_fresh_data') else self._optimized_data_loading(self.tf_trend, 1440)
+            df_analysis = self.mt5.get_ohlcv(self.tf_analysis, 500)
 
             if df_trend is None or df_analysis is None:
                 return None
