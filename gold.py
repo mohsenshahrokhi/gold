@@ -16,6 +16,7 @@ from scipy.optimize import curve_fit
 from scipy.stats import norm
 import threading
 from collections import deque
+import requests
 
 try:
     from config import BotConfig, get_config
@@ -195,6 +196,117 @@ class TradeInfo:
     def __post_init__(self):
 
         self.type = self.order_type
+
+class TelegramNotifier:
+    def __init__(self, bot_token: str = None, chat_id: str = None):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.enabled = bot_token is not None and chat_id is not None
+        self.total_profit = 0.0
+        self.total_tp_count = 0
+        self.total_trades = 0
+        self.last_trade_info = None
+        
+        if self.enabled:
+            logger.info("✅ Telegram notifications enabled")
+        else:
+            logger.info("⚠️ Telegram notifications disabled (no token/chat_id)")
+    
+    def send_message(self, message: str, parse_mode: str = "HTML"):
+        if not self.enabled:
+            return
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            data = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": parse_mode
+            }
+            response = requests.post(url, json=data, timeout=5)
+            if response.status_code != 200:
+                logger.error(f"Telegram send failed: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Error sending Telegram message: {e}")
+    
+    def notify_trade_opened(self, ticket: int, direction: str, entry: float, sl: float, tp: float, volume: float):
+        if not self.enabled:
+            return
+        
+        emoji = "📈" if direction == "BUY" else "📉"
+        message = f"""
+{emoji} <b>NEW TRADE OPENED</b>
+
+🎫 Ticket: <code>#{ticket}</code>
+📊 Direction: <b>{direction}</b>
+💰 Entry: <code>{entry:.2f}</code>
+🛡️ Stop Loss: <code>{sl:.2f}</code>
+🎯 Take Profit: <code>{tp:.2f}</code>
+📦 Volume: <code>{volume:.3f}</code> lots
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        self.send_message(message)
+        self.last_trade_info = {
+            'ticket': ticket,
+            'direction': direction,
+            'entry': entry,
+            'sl': sl,
+            'tp': tp,
+            'volume': volume
+        }
+    
+    def notify_trailing_stop(self, ticket: int, old_sl: float, new_sl: float, reason: str = ""):
+        if not self.enabled:
+            return
+        
+        message = f"""
+🔄 <b>TRAILING STOP UPDATED</b>
+
+🎫 Ticket: <code>#{ticket}</code>
+📉 Old SL: <code>{old_sl:.2f}</code>
+📈 New SL: <code>{new_sl:.2f}</code>
+📏 Change: <code>{new_sl - old_sl:+.2f}</code>
+💬 Reason: {reason}
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        self.send_message(message)
+    
+    def notify_trade_closed(self, ticket: int, profit: float, reason: str = ""):
+        if not self.enabled:
+            return
+        
+        self.total_trades += 1
+        self.total_profit += profit
+        
+        if profit > 0:
+            self.total_tp_count += 1
+        
+        profit_emoji = "✅" if profit > 0 else "❌"
+        tp_status = "TAKE PROFIT" if profit > 0 else "STOP LOSS"
+        
+        message = f"""
+{profit_emoji} <b>TRADE CLOSED - {tp_status}</b>
+
+🎫 Ticket: <code>#{ticket}</code>
+💰 Profit: <code>${profit:.2f}</code>
+💬 Reason: {reason}
+
+📊 <b>STATISTICS:</b>
+━━━━━━━━━━━━━━━━━━
+📈 Total Trades: <code>{self.total_trades}</code>
+✅ TP Count: <code>{self.total_tp_count}</code>
+❌ SL Count: <code>{self.total_trades - self.total_tp_count}</code>
+💰 Total P/L: <code>${self.total_profit:.2f}</code>
+📊 Win Rate: <code>{(self.total_tp_count / self.total_trades * 100) if self.total_trades > 0 else 0:.1f}%</code>
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        self.send_message(message)
+        
+        if self.last_trade_info and self.last_trade_info['ticket'] == ticket:
+            self.last_trade_info = None
 
 class MT5Manager:
 
@@ -776,6 +888,13 @@ class TradeManager:
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 ticket = result.order
                 logger.info(f"🎉 TRADE OPENED SUCCESSFULLY! Ticket: #{ticket}")
+
+                if hasattr(self, 'telegram'):
+                    direction_str = "BUY" if signal.direction == TrendDirection.BULLISH else "SELL"
+                    self.telegram.notify_trade_opened(
+                        ticket, direction_str, price, signal.stop_loss, 
+                        signal.take_profit, volume
+                    )
 
                 self._add_sltp_later(ticket, signal)
 
@@ -4950,9 +5069,14 @@ class ImprovedNodeBasedTrailing:
             result = mt5.order_send(request)
 
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                old_sl = pos.sl
                 logger.info(f"✅ SL UPDATED: {new_sl:.2f} | {reason}")
                 if ticket in self.trade_states:
                     self.trade_states[ticket]['current_sl'] = new_sl
+                
+                if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'telegram'):
+                    self.bot_instance.telegram.notify_trailing_stop(ticket, old_sl, new_sl, reason)
+                
                 return True
             else:
                 logger.debug(f"❌ SL update failed: {result.retcode if result else 'None'}")
@@ -5127,13 +5251,18 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
 
         self.trailing_manager = ImprovedNodeBasedTrailing(
             mt5_manager=self.mt5,
-            symbol=self.symbol
+            symbol=self.symbol,
+            bot_instance=self
         )
 
         self.trade_history = []
         self.total_trades = 0
 
         self.point = 0.1 if symbol == "BTCUSD" else 0.00001
+
+        telegram_token = os.getenv('TELEGRAM_BOT_TOKEN') or (config.telegram_token if config and hasattr(config, 'telegram_token') else None)
+        telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID') or (config.telegram_chat_id if config and hasattr(config, 'telegram_chat_id') else None)
+        self.telegram = TelegramNotifier(telegram_token, telegram_chat_id)
 
         logger.info("🤖 OptimizedGoldenmanBot with Node-Based Trailing and RL initialized")
 
@@ -5374,9 +5503,13 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             deal_history = mt5.history_deals_get(ticket=ticket, group="*")
             if deal_history:
                 total_profit = sum(deal.profit for deal in deal_history)
+                close_reason = "TP" if total_profit > 0 else "SL"
             else:
-
                 total_profit = 0.0
+                close_reason = "Unknown"
+
+            if hasattr(self, 'telegram'):
+                self.telegram.notify_trade_closed(ticket, total_profit, close_reason)
 
             self._update_rl_after_trade_close(ticket, total_profit)
 
