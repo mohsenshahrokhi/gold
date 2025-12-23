@@ -46,6 +46,4 @@ logs/
 
 # Config files with sensitive data
 config.json
-setup_telegram.bat
-setup_telegram.ps1
 
