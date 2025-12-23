@@ -1865,27 +1865,36 @@ class AdvancedGoldenmanAnalyzer:
 
             logger.info(f"   Price: {current_price:.2f}, ATR: {atr:.2f}")
 
+            spread = 0
+            point = 0.1
+            if hasattr(self, 'mt5') and hasattr(self.mt5, 'get_spread'):
+                spread = self.mt5.get_spread()
+                point = self.mt5.get_point()
+            elif hasattr(self, 'point'):
+                point = self.point
+            safety_margin = spread + (5 * point)
+
             if direction == TrendDirection.BULLISH:
                 entry = current_price
-                sl = current_price - (atr * 1.5)
-                tp = current_price + (atr * 3.0)
+                sl = current_price - (atr * 1.5) - safety_margin
+                tp = current_price + (atr * 3.0) - safety_margin
 
                 if sl >= entry:
-                    sl = entry * 0.995
+                    sl = entry * 0.995 - safety_margin
                 if tp <= entry:
-                    tp = entry * 1.01
+                    tp = entry * 1.01 - safety_margin
 
                 logger.info(f"   BUY: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}")
 
             elif direction == TrendDirection.BEARISH:
                 entry = current_price
-                sl = current_price + (atr * 1.5)
-                tp = current_price - (atr * 3.0)
+                sl = current_price + (atr * 1.5) + safety_margin
+                tp = current_price - (atr * 3.0) + safety_margin
 
                 if sl <= entry:
-                    sl = entry * 1.005
+                    sl = entry * 1.005 + safety_margin
                 if tp >= entry:
-                    tp = entry * 0.99
+                    tp = entry * 0.99 + safety_margin
 
                 logger.info(f"   SELL: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}")
 
@@ -4933,7 +4942,12 @@ class ImprovedNodeBasedTrailing:
 
                 last_node = self.get_last_node_below(state['entry_price'], 
                                                      state['nodes']['below_entry'])
-                new_sl = last_node - (5 * self.point)
+                spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
+                safety_margin = spread + (5 * self.point)
+                if state['direction'] == 'BUY':
+                    new_sl = last_node - safety_margin
+                else:
+                    new_sl = last_node + safety_margin
 
                 if self.update_sl(ticket, new_sl, "10% - Last node below entry"):
                     state['stage_10pct'] = True
@@ -4966,7 +4980,12 @@ class ImprovedNodeBasedTrailing:
                         current_price,
                         state['nodes']['all']
                     )
-                    new_sl = nearest_node - (10 * self.point)
+                    spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
+                    safety_margin = spread + (5 * self.point)
+                    if state['direction'] == 'BUY':
+                        new_sl = nearest_node - safety_margin
+                    else:
+                        new_sl = nearest_node + safety_margin
 
                     self.update_sl(ticket, new_sl, "50% - Node below market")
                     logger.info(f"   → 50% closed | SL to {new_sl:.2f} (node @ {nearest_node:.2f})")
@@ -4984,7 +5003,12 @@ class ImprovedNodeBasedTrailing:
                         current_price,
                         state['nodes']['all']
                     )
-                    new_sl = nearest_node - (10 * self.point)
+                    spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
+                    safety_margin = spread + (5 * self.point)
+                    if state['direction'] == 'BUY':
+                        new_sl = nearest_node - safety_margin
+                    else:
+                        new_sl = nearest_node + safety_margin
 
                     self.update_sl(ticket, new_sl, "70% - Node below market")
                     logger.info(f"   → 30% closed | 20% remaining to TP")
@@ -5673,39 +5697,43 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
             logger.info(f"   Strategy: {self.strategy_name}, ATR: {atr:.2f}")
             logger.info(f"   SL Multiplier: {sl_multiplier}x, TP Multiplier: {tp_multiplier}x")
 
+            spread = self.mt5.get_spread() if hasattr(self, 'mt5') and hasattr(self.mt5, 'get_spread') else 0
+            point = self.mt5.get_point() if hasattr(self, 'mt5') and hasattr(self.mt5, 'get_point') else 0.1
+            safety_margin = spread + (5 * point)
+
             if direction == TrendDirection.BULLISH:
                 entry = current_price
-                sl = current_price - (atr * sl_multiplier)
-                tp = current_price + (atr * tp_multiplier)
+                sl = current_price - (atr * sl_multiplier) - safety_margin
+                tp = current_price + (atr * tp_multiplier) - safety_margin
 
                 rr = abs(tp - entry) / abs(entry - sl)
                 if rr < min_rr:
 
-                    tp = entry + (abs(entry - sl) * min_rr)
+                    tp = entry + (abs(entry - sl) * min_rr) - safety_margin
                     logger.info(f"   Adjusted TP to maintain R/R >= {min_rr}")
 
                 if sl >= entry:
-                    sl = entry * 0.995
+                    sl = entry * 0.995 - safety_margin
                 if tp <= entry:
-                    tp = entry * 1.01
+                    tp = entry * 1.01 - safety_margin
 
                 logger.info(f"   BUY: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, R/R={rr:.2f}")
 
             elif direction == TrendDirection.BEARISH:
                 entry = current_price
-                sl = current_price + (atr * sl_multiplier)
-                tp = current_price - (atr * tp_multiplier)
+                sl = current_price + (atr * sl_multiplier) + safety_margin
+                tp = current_price - (atr * tp_multiplier) + safety_margin
 
                 rr = abs(entry - tp) / abs(sl - entry)
                 if rr < min_rr:
 
-                    tp = entry - (abs(sl - entry) * min_rr)
+                    tp = entry - (abs(sl - entry) * min_rr) + safety_margin
                     logger.info(f"   Adjusted TP to maintain R/R >= {min_rr}")
 
                 if sl <= entry:
-                    sl = entry * 1.005
+                    sl = entry * 1.005 + safety_margin
                 if tp >= entry:
-                    tp = entry * 0.99
+                    tp = entry * 0.99 + safety_margin
 
                 logger.info(f"   SELL: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, R/R={rr:.2f}")
 
