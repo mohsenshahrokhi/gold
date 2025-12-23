@@ -36,7 +36,7 @@
   "cache_enabled": true,
   "cache_ttl": 60,
   "telegram": {
-    "bot_token": null,
-    "chat_id": null
+    "bot_token": "8587645622:AAENtRBRFlTf831OI2zJcDT3dbJU-jpBSsc",
+    "chat_id": "@GoldMt5AlgoBot"
   }
 }
