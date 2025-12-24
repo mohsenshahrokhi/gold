@@ -1057,7 +1057,10 @@ class DatabaseManager:
                     WHERE symbol = ? AND strategy_name = ?
                 ''', (new_atr_weight, new_node_weight, symbol, strategy_name))
                 self.conn.commit()
-                logger.info(f"🔄 SL strategy weights optimized: ATR {atr_weight:.2f}→{new_atr_weight:.2f}, Node {node_weight:.2f}→{new_node_weight:.2f}")
+                logger.info(f"🧠 SL Strategy Weights Optimized:")
+                logger.info(f"   ATR: {atr_weight:.3f} → {new_atr_weight:.3f} ({((new_atr_weight/atr_weight - 1) * 100):+.1f}%)")
+                logger.info(f"   Node: {node_weight:.3f} → {new_node_weight:.3f} ({((new_node_weight/node_weight - 1) * 100):+.1f}%)")
+                logger.info(f"   Reason: {'ATR' if atr_perf > node_perf else 'Node'} performed better ({abs(atr_perf - node_perf):.2f} difference)")
             
         except Exception as e:
             logger.error(f"❌ Error optimizing SL strategy weights: {e}")
@@ -1195,7 +1198,9 @@ class DatabaseManager:
                         WHERE symbol = ? AND strategy_name = ? AND timeframe_name = ?
                     ''', (new_weight, symbol, strategy_name, tf_name))
                     updated = True
-                    logger.info(f"🔄 Timeframe weight optimized for {symbol}/{strategy_name}: {tf_name} {current_weight:.2f}→{new_weight:.2f}")
+                    logger.info(f"🧠 Timeframe Weight Optimized:")
+                    logger.info(f"   {tf_name}: {current_weight:.3f} → {new_weight:.3f} ({((new_weight/current_weight - 1) * 100):+.1f}%)")
+                    logger.info(f"   Performance: {performance:.2f} vs Average: {avg_performance:.2f}")
             
             if updated:
                 self.conn.commit()
@@ -1365,7 +1370,9 @@ class DatabaseManager:
                         WHERE symbol = ? AND strategy_name = ?
                     ''', (new_value, symbol, strategy_name))
                     updated = True
-                    logger.info(f"🔄 Risk param optimized for {symbol}/{strategy_name}: {param_name} {old_value:.2f}→{new_value:.2f}")
+                    logger.info(f"🧠 Risk Parameter Optimized:")
+                    logger.info(f"   {param_name}: {old_value:.3f} → {new_value:.3f} ({((new_value/old_value - 1) * 100):+.1f}%)")
+                    logger.info(f"   Performance Score: {perf:.2f} ({'✅ Positive' if perf > 0 else '❌ Negative'})")
             
             if updated:
                 self.conn.commit()
@@ -2678,10 +2685,26 @@ class AdvancedGoldenmanAnalyzer:
             
             trend_direction = self._determine_trend(df_trend, cycles_trend, poly_functions)
             
+            logger.info(f"📊 Trend Direction: {trend_direction.name if hasattr(trend_direction, 'name') else trend_direction}")
+            
+            if trend_direction == TrendDirection.NEUTRAL:
+                logger.warning("⚠️ Trend direction is NEUTRAL - cannot calculate levels")
+                logger.warning("   This usually means insufficient trend signal strength")
+                return None
+            
             entry_price, sl, tp = self._calculate_levels_simple(trend_direction, df_analysis)
             
+            logger.info(f"📊 Calculated Levels:")
+            logger.info(f"   Entry: {entry_price:.2f}")
+            logger.info(f"   SL: {sl:.2f}")
+            logger.info(f"   TP: {tp:.2f}")
+            
             if sl == 0 or tp == 0 or entry_price == 0:
-                logger.warning("Invalid levels calculated (zero values)")
+                logger.warning("⚠️ Invalid levels calculated (zero values)")
+                logger.warning(f"   Entry: {entry_price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                logger.warning(f"   Direction: {trend_direction.name if hasattr(trend_direction, 'name') else trend_direction}")
+                logger.warning(f"   DataFrame length: {len(df_analysis)}")
+                logger.warning(f"   Current price: {df_analysis['close'].values[-1] if len(df_analysis) > 0 else 'N/A'}")
                 return None
             
             if abs(entry_price - sl) < 0.01:
@@ -3124,14 +3147,31 @@ class AdvancedGoldenmanAnalyzer:
             bullish_percent = (scores['bullish'] / scores['weight']) * 100
             bearish_percent = (scores['bearish'] / scores['weight']) * 100
             
-            logger.info(f"   Trend Analysis: Bullish={bullish_percent:.1f}%, Bearish={bearish_percent:.1f}%")
+            difference = abs(bullish_percent - bearish_percent)
             
-            if bullish_percent - bearish_percent >= 10:
+            logger.info(f"   Trend Analysis: Bullish={bullish_percent:.1f}%, Bearish={bearish_percent:.1f}%, Difference={difference:.1f}%")
+            
+            min_threshold = 5.0
+            
+            if bullish_percent - bearish_percent >= min_threshold:
+                logger.info(f"   ✅ Strong BULLISH signal detected ({difference:.1f}% difference)")
                 return TrendDirection.BULLISH
-            elif bearish_percent - bullish_percent >= 10:
+            elif bearish_percent - bullish_percent >= min_threshold:
+                logger.info(f"   ✅ Strong BEARISH signal detected ({difference:.1f}% difference)")
                 return TrendDirection.BEARISH
             else:
-                return TrendDirection.NEUTRAL
+                if difference > 0:
+                    logger.warning(f"   ⚠️ Weak signal ({difference:.1f}% difference < {min_threshold}% threshold)")
+                    logger.info(f"   📊 Using dominant direction as fallback")
+                    if bullish_percent > bearish_percent:
+                        logger.info(f"   → Fallback to BULLISH (dominant: {bullish_percent:.1f}% vs {bearish_percent:.1f}%)")
+                        return TrendDirection.BULLISH
+                    else:
+                        logger.info(f"   → Fallback to BEARISH (dominant: {bearish_percent:.1f}% vs {bullish_percent:.1f}%)")
+                        return TrendDirection.BEARISH
+                else:
+                    logger.warning(f"   ⚠️ Completely NEUTRAL signal (no clear direction)")
+                    return TrendDirection.NEUTRAL
                 
         except Exception as e:
             logger.error(f"Error in trend detection: {e}")
@@ -3249,19 +3289,52 @@ class AdvancedGoldenmanAnalyzer:
                 logger.info(f"   SELL: Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, Spread={spread:.2f}")
             
             else:
+                logger.warning(f"⚠️ Invalid direction in _calculate_levels_simple: {direction}")
+                logger.warning(f"   Direction type: {type(direction)}")
+                logger.warning(f"   Direction value: {direction}")
+                return 0.0, 0.0, 0.0
+            
+            if sl <= 0 or tp <= 0 or entry <= 0:
+                logger.warning(f"⚠️ Calculated invalid levels (non-positive values)")
+                logger.warning(f"   Entry: {entry:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                logger.warning(f"   Direction: {direction.name if hasattr(direction, 'name') else direction}")
+                logger.warning(f"   Current Price: {current_price:.2f}")
+                logger.warning(f"   ATR: {atr:.2f}")
+                logger.warning(f"   Safety Margin: {safety_margin:.2f}")
                 return 0.0, 0.0, 0.0
             
             return entry, sl, tp
             
         except Exception as e:
-            logger.error(f"Error in _calculate_levels_simple: {e}")
+            logger.error(f"❌ Error in _calculate_levels_simple: {e}")
+            logger.error(f"   Direction: {direction.name if hasattr(direction, 'name') else direction}")
+            logger.error(f"   DataFrame length: {len(df) if df is not None else 0}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
 
-            current_price = df['close'].values[-1] if len(df['close'].values) > 0 else 0
-            if direction == TrendDirection.BULLISH:
-                return current_price, current_price * 0.995, current_price * 1.01
-            elif direction == TrendDirection.BEARISH:
-                return current_price, current_price * 1.005, current_price * 0.99
-            else:
+            try:
+                current_price = df['close'].values[-1] if len(df['close'].values) > 0 else 0
+                if current_price <= 0:
+                    logger.error(f"   Invalid current price: {current_price}")
+                    return 0.0, 0.0, 0.0
+                
+                if direction == TrendDirection.BULLISH:
+                    fallback_entry = current_price
+                    fallback_sl = current_price * 0.995
+                    fallback_tp = current_price * 1.01
+                    logger.warning(f"   Using fallback for BULLISH: Entry={fallback_entry:.2f}, SL={fallback_sl:.2f}, TP={fallback_tp:.2f}")
+                    return fallback_entry, fallback_sl, fallback_tp
+                elif direction == TrendDirection.BEARISH:
+                    fallback_entry = current_price
+                    fallback_sl = current_price * 1.005
+                    fallback_tp = current_price * 0.99
+                    logger.warning(f"   Using fallback for BEARISH: Entry={fallback_entry:.2f}, SL={fallback_sl:.2f}, TP={fallback_tp:.2f}")
+                    return fallback_entry, fallback_sl, fallback_tp
+                else:
+                    logger.error(f"   Invalid direction in fallback: {direction}")
+                    return 0.0, 0.0, 0.0
+            except Exception as fallback_error:
+                logger.error(f"   Fallback calculation also failed: {fallback_error}")
                 return 0.0, 0.0, 0.0
 
     def _calculate_confidence(self, quantum_state: QuantumState, hurst: float, phase_uncertainty: float, poly_functions: List[PolynomialFunction]) -> float:
@@ -6266,7 +6339,16 @@ class ImprovedNodeBasedTrailing:
                 
                 return True
             else:
-                logger.debug(f"❌ SL update failed: {result.retcode if result else 'None'}")
+                error_code = result.retcode if result else 'None'
+                error_msg = result.comment if result and hasattr(result, 'comment') else 'Unknown error'
+                logger.warning(f"❌ SL update failed: Code={error_code}, Message={error_msg}")
+                logger.warning(f"   📊 Request: SL={new_sl:.2f}, Current Price={current_price:.2f}, Min Distance={min_distance:.2f}")
+                if pos.type == mt5.ORDER_TYPE_BUY:
+                    distance_check = new_sl >= current_price - min_distance
+                    logger.warning(f"   📊 BUY Check: new_sl ({new_sl:.2f}) >= current_price - min_distance ({current_price - min_distance:.2f})? {distance_check}")
+                else:
+                    distance_check = new_sl <= current_price + min_distance
+                    logger.warning(f"   📊 SELL Check: new_sl ({new_sl:.2f}) <= current_price + min_distance ({current_price + min_distance:.2f})? {distance_check}")
                 return False
                 
         except Exception as e:
@@ -6401,22 +6483,99 @@ class ImprovedNodeBasedTrailing:
                 spread_value = state['spread']
                 commission_value = state['commission']
                 
+                positions = mt5.positions_get(ticket=ticket)
+                if not positions:
+                    logger.warning(f"   ⚠️ Cannot find position #{ticket} for breakeven")
+                    return
+                
+                pos = positions[0]
+                symbol_info = mt5.symbol_info(self.symbol)
+                if not symbol_info:
+                    logger.warning(f"   ⚠️ Cannot get symbol info for breakeven")
+                    return
+                
+                current_price = symbol_info.ask if pos.type == mt5.ORDER_TYPE_BUY else symbol_info.bid
+                min_distance = max(symbol_info.trade_stops_level * self.point, 10 * self.point)
+                
                 if state['direction'] == 'BUY':
-                    new_sl = state['entry_price'] + spread_value + commission_value + (2 * self.point)
+                    breakeven_base = state['entry_price'] + spread_value + commission_value
+                    new_sl = breakeven_base + (2 * self.point)
+                    
+                    min_breakeven_distance = max(5 * self.point, spread_value + commission_value + (3 * self.point))
+                    min_breakeven_sl = state['entry_price'] + min_breakeven_distance
+                    
+                    if new_sl < min_breakeven_sl:
+                        new_sl = min_breakeven_sl
+                        logger.info(f"   📊 Adjusted breakeven SL to minimum safe distance: {new_sl:.2f}")
+                    
                     if new_sl <= state['current_sl']:
-                        new_sl = state['current_sl'] + (2 * self.point)
+                        new_sl = max(state['current_sl'] + (2 * self.point), min_breakeven_sl)
+                        logger.info(f"   📊 Adjusted breakeven SL above current SL: {new_sl:.2f}")
+                    
+                    min_allowed_sl = current_price - min_distance
+                    if new_sl >= min_allowed_sl:
+                        safe_sl = min_allowed_sl - (10 * self.point)
+                        min_required_sl = state['entry_price'] + min_breakeven_distance
+                        
+                        if safe_sl >= min_required_sl:
+                            new_sl = safe_sl
+                            logger.warning(f"   ⚠️ Breakeven SL too close to current price, adjusted to {new_sl:.2f}")
+                            logger.warning(f"   📊 Distance from entry: {new_sl - state['entry_price']:.2f} points")
+                            logger.warning(f"   📊 Distance from current price: {current_price - new_sl:.2f} points")
+                        else:
+                            logger.warning(f"   ⚠️ Cannot set breakeven SL - too close to current price")
+                            logger.warning(f"   📊 Required SL: {min_required_sl:.2f} (entry + {min_breakeven_distance:.2f})")
+                            logger.warning(f"   📊 Max allowed SL: {min_allowed_sl:.2f} (current - {min_distance:.2f})")
+                            logger.warning(f"   📊 Current Price: {current_price:.2f}, Entry: {state['entry_price']:.2f}")
+                            logger.warning(f"   ⏸️ Waiting for price to move further before setting breakeven")
+                            return
                 else:
-                    new_sl = state['entry_price'] - spread_value - commission_value - (2 * self.point)
+                    breakeven_base = state['entry_price'] - spread_value - commission_value
+                    new_sl = breakeven_base - (2 * self.point)
+                    
+                    min_breakeven_distance = max(5 * self.point, spread_value + commission_value + (3 * self.point))
+                    max_breakeven_sl = state['entry_price'] - min_breakeven_distance
+                    
+                    if new_sl > max_breakeven_sl:
+                        new_sl = max_breakeven_sl
+                        logger.info(f"   📊 Adjusted breakeven SL to minimum safe distance: {new_sl:.2f}")
+                    
                     if new_sl >= state['current_sl']:
-                        new_sl = state['current_sl'] - (2 * self.point)
+                        new_sl = min(state['current_sl'] - (2 * self.point), max_breakeven_sl)
+                        logger.info(f"   📊 Adjusted breakeven SL below current SL: {new_sl:.2f}")
+                    
+                    max_allowed_sl = current_price + min_distance
+                    if new_sl <= max_allowed_sl:
+                        safe_sl = max_allowed_sl + (10 * self.point)
+                        max_required_sl = state['entry_price'] - min_breakeven_distance
+                        
+                        if safe_sl <= max_required_sl:
+                            new_sl = safe_sl
+                            logger.warning(f"   ⚠️ Breakeven SL too close to current price, adjusted to {new_sl:.2f}")
+                            logger.warning(f"   📊 Distance from entry: {state['entry_price'] - new_sl:.2f} points")
+                            logger.warning(f"   📊 Distance from current price: {new_sl - current_price:.2f} points")
+                        else:
+                            logger.warning(f"   ⚠️ Cannot set breakeven SL - too close to current price")
+                            logger.warning(f"   📊 Required SL: {max_required_sl:.2f} (entry - {min_breakeven_distance:.2f})")
+                            logger.warning(f"   📊 Min allowed SL: {max_allowed_sl:.2f} (current + {min_distance:.2f})")
+                            logger.warning(f"   📊 Current Price: {current_price:.2f}, Entry: {state['entry_price']:.2f}")
+                            logger.warning(f"   ⏸️ Waiting for price to move further before setting breakeven")
+                            return
                 
                 spread_pips = spread_value / self.point if self.point > 0 else 0
                 commission_pips = commission_value / self.point if self.point > 0 else 0
+                
+                logger.info(f"   📊 Breakeven calculation: Entry={state['entry_price']:.2f}, Current SL={state['current_sl']:.2f}, New SL={new_sl:.2f}")
+                logger.info(f"   📊 Spread={spread_value:.2f} ({spread_pips:.1f}p), Commission={commission_value:.2f} ({commission_pips:.1f}p)")
+                logger.info(f"   📊 Current Price={current_price:.2f}, Min Distance={min_distance:.2f}")
                 
                 if self.update_sl(ticket, new_sl, "15% - Breakeven + Spread + Comm"):
                     logger.info(f"   → SL to {new_sl:.2f} (BE + {spread_pips:.1f}p spread + {commission_pips:.1f}p comm)")
                 else:
                     logger.warning(f"   ⚠️ Failed to update SL to breakeven")
+                    logger.warning(f"   📊 Entry: {state['entry_price']:.2f}, Current SL: {state['current_sl']:.2f}, Calculated SL: {new_sl:.2f}")
+                    logger.warning(f"   📊 Spread: {spread_value:.2f}, Commission: {commission_value:.2f}, Point: {self.point}")
+                    logger.warning(f"   📊 Current Price: {current_price:.2f}, Min Distance: {min_distance:.2f}")
             
             stage_50pct = getattr(self.bot_instance, 'risk_params', {}).get('stage_50pct_partial', 0.50) * 100 if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'risk_params') else 50.0
             if not state['stage_50pct'] and progress_pct >= stage_50pct:
@@ -6703,56 +6862,61 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                     
                     if entry > 0 and sl > 0 and tp > 0:
                         current_price = df['close'].values[-1]
+                        entry_price_pos = pos.open_price if hasattr(pos, 'open_price') else pos.price_open
                         
                         if pos.type == mt5.ORDER_TYPE_BUY:
                             sl_distance = entry - sl
                             tp_distance = tp - entry
-                            sl_price = pos.price_open - sl_distance
-                            tp_price = pos.price_open + tp_distance
+                            sl_price = entry_price_pos - sl_distance
+                            tp_price = entry_price_pos + tp_distance
                         else:
                             sl_distance = sl - entry
                             tp_distance = entry - tp
-                            sl_price = pos.price_open + sl_distance
-                            tp_price = pos.price_open - tp_distance
+                            sl_price = entry_price_pos + sl_distance
+                            tp_price = entry_price_pos - tp_distance
                         
                         point = self.mt5.get_point() if hasattr(self.mt5, 'get_point') else (getattr(self, 'point', 0.1))
                         
                         if abs(sl_price - tp_price) < 0.01:
                             logger.warning(f"⚠️ Calculated SL/TP too close, using defaults")
+                            entry_price_pos = pos.open_price if hasattr(pos, 'open_price') else pos.price_open
                             sl_price = pos.sl if pos.sl > 0 else (
-                                pos.price_open - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
-                                else pos.price_open + (100 * point)
+                                entry_price_pos - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                                else entry_price_pos + (100 * point)
                             )
                             tp_price = pos.tp if pos.tp > 0 else (
-                                pos.price_open + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
-                                else pos.price_open - (150 * point)
+                                entry_price_pos + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                                else entry_price_pos - (150 * point)
                             )
                     else:
                         logger.warning(f"⚠️ Could not calculate SL/TP, using defaults")
                         point = self.mt5.get_point() if hasattr(self.mt5, 'get_point') else (getattr(self, 'point', 0.1))
+                        entry_price_pos = pos.open_price if hasattr(pos, 'open_price') else pos.price_open
                         sl_price = pos.sl if pos.sl > 0 else (
-                            pos.price_open - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
-                            else pos.price_open + (100 * point)
+                            entry_price_pos - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                            else entry_price_pos + (100 * point)
                         )
                         tp_price = pos.tp if pos.tp > 0 else (
-                            pos.price_open + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
-                            else pos.price_open - (150 * point)
+                            entry_price_pos + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                            else entry_price_pos - (150 * point)
                         )
                 else:
                     logger.warning(f"⚠️ Cannot get price data, using defaults")
                     point = self.mt5.get_point() if hasattr(self.mt5, 'get_point') else (getattr(self, 'point', 0.1))
+                    entry_price_pos = pos.open_price if hasattr(pos, 'open_price') else pos.price_open
                     sl_price = pos.sl if pos.sl > 0 else (
-                        pos.price_open - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
-                        else pos.price_open + (100 * point)
+                        entry_price_pos - (100 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                        else entry_price_pos + (100 * point)
                     )
                     tp_price = pos.tp if pos.tp > 0 else (
-                        pos.price_open + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
-                        else pos.price_open - (150 * point)
+                        entry_price_pos + (150 * point) if pos.type == mt5.ORDER_TYPE_BUY 
+                        else entry_price_pos - (150 * point)
                     )
             
             if abs(sl_price - tp_price) < 0.01:
                 logger.error(f"❌ Invalid SL/TP values: SL={sl_price:.2f}, TP={tp_price:.2f} (too close or equal)")
-                logger.error(f"   Entry price: {pos.price_open:.2f}")
+                entry_price_pos = pos.open_price if hasattr(pos, 'open_price') else pos.price_open
+                logger.error(f"   Entry price: {entry_price_pos:.2f}")
                 return False
             
             self.trailing_manager.initialize_trade_state(
@@ -6780,42 +6944,72 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             logger.info("=" * 70)
             logger.info("🚀 EXECUTING TRADE WITH NODE-BASED MANAGEMENT")
             logger.info("=" * 70)
+            logger.info(f"📊 Signal Details:")
+            logger.info(f"   Direction: {signal.direction.name}")
+            logger.info(f"   Entry Price: {signal.entry_price:.2f}")
+            logger.info(f"   Stop Loss: {signal.stop_loss:.2f}")
+            logger.info(f"   Take Profit: {signal.take_profit:.2f}")
+            logger.info(f"   Confidence: {signal.confidence:.2f}")
+            logger.info(f"   Strategy: {self.strategy_name}")
+            logger.info(f"   Symbol: {self.symbol}")
             
             ticket = self.trade.open_trade_safe(signal)
             if not ticket:
                 logger.error("❌ Trade opening failed via TradeManager")
+                logger.error(f"   Signal: {signal.direction.name} @ {signal.entry_price:.2f}")
+                logger.error(f"   Reason: TradeManager returned None")
                 return None
             
             logger.info(f"✅ Trade opened via TradeManager! Ticket: #{ticket}")
             
             symbol_info = mt5.symbol_info(self.symbol)
             spread_pips = symbol_info.spread if symbol_info else 10.0
-            commission = 0.0
+            commission = self._calculate_commission_for_trade()
+            
+            logger.info(f"📊 Market Info:")
+            logger.info(f"   Spread: {spread_pips:.1f} pips")
+            logger.info(f"   Commission: {commission:.2f} points")
             
             nodes = self.trailing_manager.detect_nodes(
                 timeframe=mt5.TIMEFRAME_M3,
                 lookback=100
             )
             
+            logger.info(f"📊 Node Detection:")
+            logger.info(f"   Nodes Below Entry: {len(nodes.get('below_entry', []))}")
+            logger.info(f"   Nodes Above Entry: {len(nodes.get('above_entry', []))}")
+            logger.info(f"   Total Nodes: {len(nodes.get('all', []))}")
+            
             positions = self.mt5.get_active_positions()
             if not positions:
+                logger.warning(f"⚠️ No positions found after opening trade #{ticket}")
                 return ticket
             
             pos = positions[0]
             
+            entry_price = pos.open_price if hasattr(pos, 'open_price') else pos.price_open
+            
+            logger.info(f"📊 Position Details:")
+            logger.info(f"   Ticket: #{ticket}")
+            logger.info(f"   Entry Price: {entry_price:.2f}")
+            logger.info(f"   Volume: {pos.volume:.2f} lots")
+            logger.info(f"   Current SL: {pos.sl:.2f}")
+            logger.info(f"   Current TP: {pos.tp:.2f}")
+            
             self.trailing_manager.initialize_trade_state(
                 ticket=ticket,
-                entry_price=pos.price_open,
+                entry_price=entry_price,
                 sl=signal.stop_loss,
                 tp=signal.take_profit,
                 volume=pos.volume,
                 direction="BUY" if signal.direction == TrendDirection.BULLISH else "SELL",
                 nodes=nodes,
                 spread=spread_pips,
-                commission=self._calculate_commission_for_trade()
+                commission=commission
             )
             
             logger.info("🎉 Node-Based Trailing ACTIVE")
+            logger.info(f"   Trailing Stop initialized for ticket #{ticket}")
             
             self.total_trades += 1
             
@@ -6836,10 +7030,15 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 'exit_confirm_tf': self._get_timeframe_name(self.strategy_config.exit_confirm_tf)
             }
             
+            logger.info(f"📊 Analysis Details:")
+            logger.info(f"   SL Method: {sl_method}")
+            logger.info(f"   Timeframes: {', '.join(tf_names.values())}")
+            logger.info(f"   Predictions: {len(predictions)} analyzers")
+            
             self.trade_history.append({
                 'ticket': ticket,
                 'entry_time': datetime.now(),
-                'entry_price': pos.price_open,
+                'entry_price': entry_price,
                 'volume': pos.volume,
                 'direction': signal.direction,
                 'signal_confidence': signal.confidence,
@@ -6848,16 +7047,26 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 'timeframes': tf_names
             })
             
+            logger.info("=" * 70)
+            logger.info(f"✅ Trade #{ticket} successfully initialized and ready for management")
+            logger.info("=" * 70)
+            
             return ticket
             
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"❌ Error in _execute_trade_with_nodes: {e}")
+            logger.error(f"   Signal: {signal.direction.name if signal else 'None'} @ {signal.entry_price if signal else 'N/A':.2f}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
             return None
     
     def _handle_closed_trade(self, ticket: int):
 
         try:
-
+            logger.info("=" * 70)
+            logger.info(f"📊 HANDLING CLOSED TRADE #{ticket}")
+            logger.info("=" * 70)
+            
             trade_info = None
             for trade in self.trade_history:
                 if trade['ticket'] == ticket:
@@ -6865,41 +7074,122 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                     break
             
             if not trade_info:
+                logger.warning(f"⚠️ Trade #{ticket} not found in trade_history")
                 return
             
-            deal_history = mt5.history_deals_get(ticket=ticket, group="*")
-            if deal_history:
-                total_profit = sum(deal.profit for deal in deal_history)
-                close_reason = "TP" if total_profit > 0 else "SL"
+            logger.info(f"📊 Trade History Found:")
+            logger.info(f"   Entry Time: {trade_info.get('entry_time', 'N/A')}")
+            logger.info(f"   Entry Price: {trade_info.get('entry_price', 0):.2f}")
+            logger.info(f"   Volume: {trade_info.get('volume', 0):.2f} lots")
+            logger.info(f"   Direction: {trade_info.get('direction', 'N/A')}")
+            logger.info(f"   Confidence: {trade_info.get('signal_confidence', 0):.2f}")
+            
+            entry_time = trade_info.get('entry_time', datetime.now())
+            if isinstance(entry_time, datetime):
+                from_time = entry_time
             else:
+                from_time = datetime.now() - timedelta(days=1)
+            
+            to_time = datetime.now()
+            
+            logger.info(f"📊 Searching for deal history...")
+            logger.info(f"   From: {from_time}")
+            logger.info(f"   To: {to_time}")
+            
+            deal_history = mt5.history_deals_get(from_time, to_time, group="*")
+            if deal_history:
+                position_deals = [deal for deal in deal_history if deal.position_id == ticket]
+                if not position_deals:
+                    position_deals = [deal for deal in deal_history if hasattr(deal, 'ticket') and deal.ticket == ticket]
+                
+                if position_deals:
+                    total_profit = sum(deal.profit for deal in position_deals)
+                    close_reason = "TP" if total_profit > 0 else "SL"
+                    
+                    close_deal = None
+                    for deal in position_deals:
+                        if deal.entry == mt5.DEAL_ENTRY_OUT:
+                            close_deal = deal
+                            break
+                    
+                    if not close_deal and position_deals:
+                        close_deal = position_deals[-1]
+                    
+                    exit_price = close_deal.price if close_deal else 0.0
+                    final_sl = trade_info.get('sl', 0.0)
+                    final_tp = trade_info.get('tp', 0.0)
+                    
+                    logger.info(f"📊 Deal History Found:")
+                    logger.info(f"   Total Deals: {len(position_deals)}")
+                    logger.info(f"   Total Profit: ${total_profit:.2f}")
+                    logger.info(f"   Close Reason: {close_reason}")
+                    logger.info(f"   Exit Price: {exit_price:.2f}")
+                else:
+                    logger.warning(f"⚠️ No deals found for position #{ticket}")
+                    total_profit = 0.0
+                    close_reason = "Unknown"
+                    exit_price = trade_info.get('entry_price', 0.0)
+                    final_sl = trade_info.get('sl', 0.0)
+                    final_tp = trade_info.get('tp', 0.0)
+            else:
+                logger.warning(f"⚠️ No deal history found for ticket #{ticket}")
                 total_profit = 0.0
                 close_reason = "Unknown"
+                exit_price = trade_info.get('entry_price', 0.0)
+                final_sl = trade_info.get('sl', 0.0)
+                final_tp = trade_info.get('tp', 0.0)
             
             if hasattr(self, 'telegram'):
                 self.telegram.notify_trade_closed(ticket, total_profit, close_reason)
+                logger.info(f"📱 Telegram notification sent")
 
             if hasattr(self, 'db'):
                 positions = mt5.positions_get(ticket=ticket)
                 if positions:
                     pos = positions[0]
-                    self.db.update_trade_close(
-                        ticket=ticket,
-                        exit_price=pos.price_current,
-                        profit=total_profit,
-                        close_reason=close_reason,
-                        sl_final=pos.sl,
-                        tp_final=pos.tp
-                    )
+                    exit_price = pos.price_current if hasattr(pos, 'price_current') else (pos.price_open if hasattr(pos, 'price_open') else exit_price)
+                    final_sl = pos.sl if pos.sl > 0 else final_sl
+                    final_tp = pos.tp if pos.tp > 0 else final_tp
+                    logger.info(f"📊 Database Update (from active position):")
+                    logger.info(f"   Exit Price: {exit_price:.2f}")
+                    logger.info(f"   Final SL: {final_sl:.2f}")
+                    logger.info(f"   Final TP: {final_tp:.2f}")
+                else:
+                    logger.info(f"📊 Database Update (from deal history):")
+                    logger.info(f"   Exit Price: {exit_price:.2f}")
+                    logger.info(f"   Final SL: {final_sl:.2f}")
+                    logger.info(f"   Final TP: {final_tp:.2f}")
+                
+                self.db.update_trade_close(
+                    ticket=ticket,
+                    exit_price=exit_price,
+                    profit=total_profit,
+                    close_reason=close_reason,
+                    sl_final=final_sl,
+                    tp_final=final_tp
+                )
+                logger.info(f"✅ Trade data saved to database")
 
+            logger.info(f"🔄 Updating RL after trade close...")
             self._update_rl_after_trade_close(ticket, total_profit)
             
+            logger.info("=" * 70)
+            logger.info(f"✅ Trade #{ticket} handling completed")
+            logger.info("=" * 70)
+            
         except Exception as e:
-            logger.error(f"Error handling closed trade: {e}")
+            logger.error(f"❌ Error handling closed trade #{ticket}: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
     
     def _update_rl_after_trade_close(self, ticket: int, profit: float):
 
         try:
-
+            logger.info("=" * 70)
+            logger.info(f"🧠 RL LEARNING: Starting parameter updates for trade #{ticket}")
+            logger.info("=" * 70)
+            logger.info(f"📊 Trade Result: ${profit:.2f} {'✅ PROFIT' if profit > 0 else '❌ LOSS'}")
+            
             trade_info = None
             for trade in self.trade_history:
                 if trade['ticket'] == ticket:
@@ -6907,15 +7197,26 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                     break
             
             if not trade_info:
+                logger.warning(f"⚠️ Trade info not found for ticket #{ticket}")
                 return
+            
+            logger.info(f"📊 Trade Info:")
+            logger.info(f"   Profit: ${profit:.2f}")
+            logger.info(f"   Volume: {trade_info.get('volume', 0):.2f} lots")
+            logger.info(f"   Confidence: {trade_info.get('signal_confidence', 0):.2f}")
             
             df = self.mt5.get_ohlcv(mt5.TIMEFRAME_M3, 100)
             if df is None or len(df) < 10:
+                logger.warning(f"⚠️ Insufficient market data for RL update")
                 return
             
             prices = df['close'].values[-20:]
             returns = np.diff(prices, prepend=prices[0])
             volatility = np.std(returns)
+            
+            logger.info(f"📊 Market State:")
+            logger.info(f"   Volatility: {volatility:.4f}")
+            logger.info(f"   Price Range: {prices.min():.2f} - {prices.max():.2f}")
             
             state = np.concatenate([
                 prices[-10:] / prices[-1],
@@ -6939,6 +7240,11 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             else:
                 transaction_cost = 0.0
             
+            logger.info(f"📊 Transaction Costs:")
+            logger.info(f"   Spread Cost: ${spread_cost:.2f}")
+            logger.info(f"   Commission Cost: ${commission_cost:.2f}")
+            logger.info(f"   Total Transaction Cost: ${transaction_cost * 100:.2f}")
+            
             gamma = 0.1
             
             account_info = self.mt5.account_info
@@ -6949,49 +7255,219 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             else:
                 drawdown = 0.0
             
+            logger.info(f"📊 Account State:")
+            logger.info(f"   Equity: ${equity:.2f}")
+            logger.info(f"   Balance: ${balance:.2f}")
+            logger.info(f"   Drawdown: {drawdown * 100:.2f}%")
+            
             risk_penalty = volatility * 0.5 + drawdown * 0.3
             eta = 0.2
             
             reward = delta_p - gamma * transaction_cost - eta * risk_penalty
             
-            if trade_info['signal_confidence'] > 0.8 and profit < 0:
-
-                reward -= 0.15
-            elif trade_info['signal_confidence'] > 0.8 and profit > 0:
-
-                reward += 0.15
+            logger.info(f"📊 Reward Calculation:")
+            logger.info(f"   Delta P: {delta_p:.4f}")
+            logger.info(f"   Transaction Cost Penalty: {gamma * transaction_cost:.4f}")
+            logger.info(f"   Risk Penalty: {eta * risk_penalty:.4f}")
+            logger.info(f"   Base Reward: {reward:.4f}")
             
+            if trade_info['signal_confidence'] > 0.8 and profit < 0:
+                reward -= 0.15
+                logger.info(f"   High Confidence Loss Penalty: -0.15")
+            elif trade_info['signal_confidence'] > 0.8 and profit > 0:
+                reward += 0.15
+                logger.info(f"   High Confidence Win Bonus: +0.15")
+            
+            logger.info(f"   Final Reward: {reward:.4f}")
+            
+            logger.info("=" * 70)
+            logger.info(f"🧠 STEP 1: Updating RL Neural Network Models")
+            logger.info("=" * 70)
+            logger.info(f"🔄 Training RL models with reward: {reward:.4f}")
+            logger.info(f"   State vector size: {len(state)}")
+            logger.info(f"   Volume normalized: {trade_info['volume'] / self.max_lots:.3f}")
             self.nds.article_models.update_rl_after_trade(state, 
                                                           trade_info['volume'] / self.max_lots, 
                                                           reward, 
                                                           done=True)
+            logger.info(f"✅ RL neural network models trained and updated")
             
+            logger.info("=" * 70)
+            logger.info(f"🧠 STEP 2: Updating Analyzer Weights")
+            logger.info("=" * 70)
+            old_weights = self.nds.analyzer_weights.copy() if hasattr(self.nds, 'analyzer_weights') else {}
             self._update_analyzer_weights(trade_info, profit)
+            new_weights = self.nds.analyzer_weights if hasattr(self.nds, 'analyzer_weights') else {}
+            
+            logger.info(f"📊 Weight Changes:")
+            for key in set(list(old_weights.keys()) + list(new_weights.keys())):
+                old_val = old_weights.get(key, 0)
+                new_val = new_weights.get(key, 0)
+                if abs(new_val - old_val) > 0.001:
+                    change_pct = ((new_val / old_val - 1) * 100) if old_val > 0 else 0
+                    logger.info(f"   {key}: {old_val:.3f} → {new_val:.3f} ({change_pct:+.1f}%)")
             
             if hasattr(self, 'db'):
+                logger.info(f"💾 Saving to database...")
                 self.db.save_analyzer_weights(self.symbol, self.nds.analyzer_weights)
+                logger.info(f"   ✅ Analyzer weights saved")
                 
+                logger.info("=" * 70)
+                logger.info(f"🧠 STEP 3: Optimizing SL Strategy Weights (ATR vs Node)")
+                logger.info("=" * 70)
                 sl_method = trade_info.get('sl_method', 'combined')
                 if sl_method == 'atr' or sl_method == 'node':
+                    cursor = self.db.conn.cursor()
+                    cursor.row_factory = sqlite3.Row
+                    cursor.execute('''
+                        SELECT atr_weight, node_weight, atr_performance, node_performance
+                        FROM sl_strategy_weights
+                        WHERE symbol = ? AND strategy_name = ?
+                    ''', (self.symbol, self.strategy_name))
+                    row_before = cursor.fetchone()
+                    
+                    logger.info(f"📊 Before Update:")
+                    if row_before:
+                        logger.info(f"   ATR Weight: {row_before['atr_weight']:.3f}, Performance: {row_before['atr_performance'] or 0:.2f}")
+                        logger.info(f"   Node Weight: {row_before['node_weight']:.3f}, Performance: {row_before['node_performance'] or 0:.2f}")
+                    
+                    logger.info(f"🔄 Updating {sl_method.upper()} performance with profit: ${profit:.2f}")
                     self.db.update_sl_strategy_performance(
                         self.symbol, self.strategy_name, sl_method, profit
                     )
+                    
+                    cursor.execute('''
+                        SELECT atr_weight, node_weight, atr_performance, node_performance
+                        FROM sl_strategy_weights
+                        WHERE symbol = ? AND strategy_name = ?
+                    ''', (self.symbol, self.strategy_name))
+                    row_after = cursor.fetchone()
+                    
+                    logger.info(f"📊 After Update:")
+                    if row_after and row_before:
+                        logger.info(f"   ATR Weight: {row_before['atr_weight']:.3f} → {row_after['atr_weight']:.3f}")
+                        logger.info(f"   Node Weight: {row_before['node_weight']:.3f} → {row_after['node_weight']:.3f}")
+                        logger.info(f"   ATR Performance: {row_before['atr_performance'] or 0:.2f} → {row_after['atr_performance'] or 0:.2f}")
+                        logger.info(f"   Node Performance: {row_before['node_performance'] or 0:.2f} → {row_after['node_performance'] or 0:.2f}")
+                    
+                    logger.info(f"✅ SL strategy performance updated")
+                    
+                    self.db._optimize_sl_strategy_weights(self.symbol, self.strategy_name)
                 
+                logger.info("=" * 70)
+                logger.info(f"🧠 STEP 4: Optimizing Timeframe Weights")
+                logger.info("=" * 70)
                 timeframes = trade_info.get('timeframes', {})
                 if timeframes:
+                    cursor = self.db.conn.cursor()
+                    cursor.row_factory = sqlite3.Row
+                    cursor.execute('''
+                        SELECT timeframe_name, weight, performance
+                        FROM timeframe_weights
+                        WHERE symbol = ? AND strategy_name = ?
+                    ''', (self.symbol, self.strategy_name))
+                    rows_before = {row['timeframe_name']: {'weight': row['weight'], 'performance': row['performance'] or 0.0} 
+                                  for row in cursor.fetchall()}
+                    
+                    logger.info(f"📊 Before Update:")
+                    for tf_name, tf_data in rows_before.items():
+                        logger.info(f"   {tf_name}: Weight={tf_data['weight']:.3f}, Performance={tf_data['performance']:.2f}")
+                    
+                    logger.info(f"🔄 Updating timeframe performance with profit: ${profit:.2f}")
                     total_weight = sum(1.0 for _ in timeframes.values())
                     timeframe_contributions = {tf_name: 1.0 / total_weight for tf_name in timeframes.values()}
                     self.db.update_timeframe_performance(
                         self.symbol, self.strategy_name, timeframe_contributions, profit
                     )
+                    logger.info(f"✅ Timeframe performance updated")
+                    
+                    self.db._optimize_timeframe_weights(self.symbol, self.strategy_name)
+                    
+                    cursor.execute('''
+                        SELECT timeframe_name, weight, performance
+                        FROM timeframe_weights
+                        WHERE symbol = ? AND strategy_name = ?
+                    ''', (self.symbol, self.strategy_name))
+                    rows_after = {row['timeframe_name']: {'weight': row['weight'], 'performance': row['performance'] or 0.0} 
+                                 for row in cursor.fetchall()}
+                    
+                    logger.info(f"📊 After Optimization:")
+                    for tf_name in set(list(rows_before.keys()) + list(rows_after.keys())):
+                        old_weight = rows_before.get(tf_name, {}).get('weight', 0)
+                        new_weight = rows_after.get(tf_name, {}).get('weight', 0)
+                        if abs(new_weight - old_weight) > 0.01:
+                            change_pct = ((new_weight / old_weight - 1) * 100) if old_weight > 0 else 0
+                            logger.info(f"   {tf_name}: {old_weight:.3f} → {new_weight:.3f} ({change_pct:+.1f}%)")
                 
+                logger.info("=" * 70)
+                logger.info(f"🧠 STEP 5: Optimizing Risk Management Parameters")
+                logger.info("=" * 70)
+                cursor = self.db.conn.cursor()
+                cursor.row_factory = sqlite3.Row
+                cursor.execute('''
+                    SELECT safety_margin_multiplier, min_sl_distance_multiplier,
+                           trailing_distance_multiplier, breakeven_trigger_pips,
+                           min_confidence, min_risk_reward, performance_score
+                    FROM risk_management_params
+                    WHERE symbol = ? AND strategy_name = ?
+                ''', (self.symbol, self.strategy_name))
+                row_before = cursor.fetchone()
+                
+                if row_before:
+                    logger.info(f"📊 Before Update:")
+                    logger.info(f"   Safety Margin: {row_before['safety_margin_multiplier']:.2f}")
+                    logger.info(f"   Min SL Distance: {row_before['min_sl_distance_multiplier']:.2f}")
+                    logger.info(f"   Trailing Distance: {row_before['trailing_distance_multiplier']:.2f}")
+                    logger.info(f"   Breakeven Trigger: {row_before['breakeven_trigger_pips']:.1f} pips")
+                    logger.info(f"   Min Confidence: {row_before['min_confidence']:.2f}")
+                    logger.info(f"   Min R/R: {row_before['min_risk_reward']:.2f}")
+                    logger.info(f"   Performance Score: {row_before['performance_score']:.2f}")
+                
+                logger.info(f"🔄 Updating risk parameters performance with profit: ${profit:.2f}")
                 self.db.update_risk_params_performance(self.symbol, self.strategy_name, profit)
+                logger.info(f"✅ Risk parameters performance updated")
                 
+                if self.db.get_trade_statistics(self.symbol, days=30) and self.db.get_trade_statistics(self.symbol, days=30).get('total_trades', 0) % 15 == 0:
+                    logger.info(f"🔄 Optimizing risk management parameters (every 15 trades)...")
+                    self.db._optimize_risk_management_params(self.symbol, self.strategy_name)
+                    
+                    cursor.execute('''
+                        SELECT safety_margin_multiplier, min_sl_distance_multiplier,
+                               trailing_distance_multiplier, breakeven_trigger_pips,
+                               min_confidence, min_risk_reward, performance_score
+                        FROM risk_management_params
+                        WHERE symbol = ? AND strategy_name = ?
+                    ''', (self.symbol, self.strategy_name))
+                    row_after = cursor.fetchone()
+                    
+                    if row_after and row_before:
+                        logger.info(f"📊 After Optimization:")
+                        params = ['safety_margin_multiplier', 'min_sl_distance_multiplier', 
+                                 'trailing_distance_multiplier', 'breakeven_trigger_pips',
+                                 'min_confidence', 'min_risk_reward']
+                        for param in params:
+                            old_val = row_before[param]
+                            new_val = row_after[param]
+                            if abs(new_val - old_val) > 0.01:
+                                change_pct = ((new_val / old_val - 1) * 100) if old_val > 0 else 0
+                                logger.info(f"   {param}: {old_val:.2f} → {new_val:.2f} ({change_pct:+.1f}%)")
+                
+                logger.info("=" * 70)
+                logger.info(f"🧠 STEP 6: Optimizing Strategy Multipliers (SL/TP/RR)")
+                logger.info("=" * 70)
                 stats = self.db.get_trade_statistics(self.symbol, days=30)
                 if stats:
+                    logger.info(f"📊 Trade Statistics (Last 30 days):")
+                    logger.info(f"   Total Trades: {stats.get('total_trades', 0)}")
+                    logger.info(f"   Win Rate: {stats.get('win_rate', 0) * 100:.1f}%")
+                    logger.info(f"   Total Profit: ${stats.get('total_profit', 0):.2f}")
+                    logger.info(f"   Profit Factor: {stats.get('profit_factor', 0):.2f}")
+                    
+                    logger.info(f"🔄 Updating multiplier performance scores...")
                     self.db.update_multiplier_performance(
                         self.symbol, self.strategy_name, stats
                     )
+                    logger.info(f"✅ Multiplier performance scores updated")
                     
                     cursor = self.db.conn.cursor()
                     cursor.execute('''
@@ -7006,10 +7482,12 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                     recent_trades = [{'profit': row['profit']} for row in rows]
                     
                     if len(recent_trades) >= 10:
+                        logger.info(f"   📊 Optimizing multipliers with {len(recent_trades)} recent trades...")
                         new_sl, new_tp, new_rr = self.db.optimize_multipliers(
                             self.symbol, self.strategy_name, recent_trades
                         )
                         if new_sl and new_tp and new_rr:
+                            logger.info(f"   ✅ Optimization complete: SL={new_sl:.2f}, TP={new_tp:.2f}, R/R={new_rr:.2f}")
                             current = self.db.load_strategy_multipliers(self.symbol, self.strategy_name)
                             if current:
                                 old_sl = current['sl_multiplier']
@@ -7023,9 +7501,27 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                                         self.symbol, self.strategy_name,
                                         new_sl, new_tp, new_rr, score
                                     )
-                                    logger.info(f"🔄 Multipliers optimized: SL {old_sl:.2f}→{new_sl:.2f}, TP {old_tp:.2f}→{new_tp:.2f}")
+                                    logger.info("=" * 70)
+                                    logger.info(f"🧠 STEP 6: Strategy Multipliers Optimized")
+                                    logger.info("=" * 70)
+                                    logger.info(f"📊 Symbol: {self.symbol}")
+                                    logger.info(f"📊 Strategy: {self.strategy_name}")
+                                    logger.info(f"📊 Recent Trades Analyzed: {len(recent_trades)}")
+                                    logger.info(f"📊 Performance Score: {score:.2f}")
+                                    logger.info(f"📊 Multiplier Changes:")
+                                    logger.info(f"   SL Multiplier: {old_sl:.2f} → {new_sl:.2f} ({((new_sl/old_sl - 1) * 100):+.1f}%)")
+                                    logger.info(f"   TP Multiplier: {old_tp:.2f} → {new_tp:.2f} ({((new_tp/old_tp - 1) * 100):+.1f}%)")
+                                    logger.info(f"   Min R/R: {new_rr:.2f}")
+                                    logger.info("=" * 70)
             
-            logger.info(f"📊 RL updated for trade #{ticket}, Profit: ${profit:.2f}, Reward: {reward:.4f}")
+            logger.info("=" * 70)
+            logger.info(f"✅ RL LEARNING COMPLETE for trade #{ticket}")
+            logger.info("=" * 70)
+            logger.info(f"📊 Summary:")
+            logger.info(f"   Trade Profit: ${profit:.2f}")
+            logger.info(f"   Calculated Reward: {reward:.4f}")
+            logger.info(f"   All parameters updated and saved to database")
+            logger.info("=" * 70)
             
         except Exception as e:
             logger.error(f"Error updating RL after trade close: {e}")
@@ -7095,11 +7591,26 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 
                 self.nds.analyzer_weights[signal_weight_name] = new_weight
             
-            logger.info(f"📈 Analyzer weights updated after trade #{trade_info['ticket']}")
-            logger.info(f"   Weights: {', '.join([f'{k}={v:.3f}' for k, v in self.nds.analyzer_weights.items()])}")
+            logger.info("=" * 70)
+            logger.info(f"📈 ANALYZER WEIGHTS UPDATE COMPLETE")
+            logger.info("=" * 70)
+            logger.info(f"📊 Trade: #{trade_info.get('ticket', 'N/A')}")
+            logger.info(f"   Profit: ${profit:.2f}")
+            logger.info(f"   Direction: {trade_direction.name if hasattr(trade_direction, 'name') else trade_direction}")
+            logger.info(f"   Is Profitable: {is_profitable}")
+            logger.info(f"   Learning Rate: {learning_rate}")
+            logger.info(f"📊 Updated Weights:")
+            for analyzer_name, weight in self.nds.analyzer_weights.items():
+                if analyzer_name in predictions:
+                    predicted = predictions[analyzer_name]
+                    logger.info(f"   {analyzer_name}: {weight:.3f} (Predicted: {predicted.name if hasattr(predicted, 'name') else predicted})")
+            logger.info("=" * 70)
             
         except Exception as e:
-            logger.error(f"Error updating analyzer weights: {e}")
+            logger.error(f"❌ Error updating analyzer weights: {e}")
+            logger.error(f"   Trade Info: {trade_info.get('ticket', 'N/A')}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
         
     def _should_report(self, current_time: datetime) -> bool:
         if not hasattr(self, '_last_report'):
