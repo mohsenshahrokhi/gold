@@ -160,11 +160,18 @@ class GoldenmanSignal:
     risk_reward: float
     timestamp: datetime
     nodes: List[Node] = field(default_factory=list)
+    sl_method: str = field(default="combined")
     
     def is_valid(self) -> bool:
 
-        return (self.confidence > 0.6 and 
-                self.risk_reward >= 1.5 and 
+        min_conf = 0.6
+        min_rr = 1.5
+        if hasattr(self, '_risk_params'):
+            min_conf = self._risk_params.get('min_confidence', 0.6)
+            min_rr = self._risk_params.get('min_risk_reward', 1.5)
+        
+        return (self.confidence > min_conf and 
+                self.risk_reward >= min_rr and 
                 self.direction != TrendDirection.NEUTRAL)
 
 @dataclass
@@ -485,6 +492,21 @@ class DatabaseManager:
             )
         ''')
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS strategy_multipliers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+                sl_multiplier REAL NOT NULL,
+                tp_multiplier REAL NOT NULL,
+                min_rr REAL NOT NULL,
+                performance_score REAL,
+                total_trades INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, strategy_name)
+            )
+        ''')
+        
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)')
@@ -493,6 +515,64 @@ class DatabaseManager:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_journal_symbol ON trade_journal(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_statistics_symbol_date ON statistics(symbol, date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_errors_timestamp ON errors(timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_multipliers_symbol_strategy ON strategy_multipliers(symbol, strategy_name)')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sl_strategy_weights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+                atr_weight REAL NOT NULL DEFAULT 0.5,
+                node_weight REAL NOT NULL DEFAULT 0.5,
+                atr_performance REAL DEFAULT 0.0,
+                node_performance REAL DEFAULT 0.0,
+                total_trades INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, strategy_name)
+            )
+        ''')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sl_weights_symbol_strategy ON sl_strategy_weights(symbol, strategy_name)')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS timeframe_weights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+                timeframe_name TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                performance REAL DEFAULT 0.0,
+                total_usage INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, strategy_name, timeframe_name)
+            )
+        ''')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tf_weights_symbol_strategy ON timeframe_weights(symbol, strategy_name)')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS risk_management_params (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+                safety_margin_multiplier REAL DEFAULT 1.0,
+                min_sl_distance_multiplier REAL DEFAULT 2.0,
+                trailing_distance_multiplier REAL DEFAULT 8.0,
+                breakeven_trigger_pips REAL DEFAULT 10.0,
+                min_confidence REAL DEFAULT 0.6,
+                min_risk_reward REAL DEFAULT 1.5,
+                stage_10pct REAL DEFAULT 0.10,
+                stage_15pct_breakeven REAL DEFAULT 0.15,
+                stage_50pct_partial REAL DEFAULT 0.50,
+                stage_70pct_partial REAL DEFAULT 0.70,
+                performance_score REAL DEFAULT 0.0,
+                total_trades INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, strategy_name)
+            )
+        ''')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_risk_params_symbol_strategy ON risk_management_params(symbol, strategy_name)')
         
         self.conn.commit()
     
@@ -718,6 +798,581 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"❌ Error getting best strategy/symbol: {e}")
             return None, None, {}
+    
+    def save_strategy_multipliers(self, symbol: str, strategy_name: str, 
+                                  sl_multiplier: float, tp_multiplier: float, 
+                                  min_rr: float, performance_score: float = None):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO strategy_multipliers 
+                (symbol, strategy_name, sl_multiplier, tp_multiplier, min_rr, 
+                 performance_score, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (symbol, strategy_name, sl_multiplier, tp_multiplier, min_rr, performance_score))
+            self.conn.commit()
+            logger.debug(f"✅ Strategy multipliers saved for {symbol}/{strategy_name}")
+        except Exception as e:
+            logger.error(f"❌ Error saving strategy multipliers: {e}")
+            self.conn.rollback()
+    
+    def load_strategy_multipliers(self, symbol: str, strategy_name: str) -> Optional[Dict]:
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT sl_multiplier, tp_multiplier, min_rr, performance_score, total_trades
+                FROM strategy_multipliers
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'sl_multiplier': row['sl_multiplier'],
+                    'tp_multiplier': row['tp_multiplier'],
+                    'min_rr': row['min_rr'],
+                    'performance_score': row['performance_score'],
+                    'total_trades': row['total_trades']
+                }
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error loading strategy multipliers: {e}")
+            return None
+    
+    def update_multiplier_performance(self, symbol: str, strategy_name: str, 
+                                      trade_result: Dict):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT sl_multiplier, tp_multiplier, total_trades, performance_score
+                FROM strategy_multipliers
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            
+            if not row:
+                return
+            
+            current_trades = row['total_trades'] or 0
+            current_score = row['performance_score'] or 0.0
+            profit = trade_result.get('total_profit', 0.0)
+            win_rate = trade_result.get('win_rate', 0.0)
+            profit_factor = trade_result.get('profit_factor', 0.0)
+            
+            new_score = (profit * 0.4) + (win_rate * 10 * 0.3) + (profit_factor * 100 * 0.3)
+            
+            alpha = 0.1
+            updated_score = current_score * (1 - alpha) + new_score * alpha
+            
+            cursor.execute('''
+                UPDATE strategy_multipliers
+                SET performance_score = ?, total_trades = total_trades + 1
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (updated_score, symbol, strategy_name))
+            self.conn.commit()
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating multiplier performance: {e}")
+            self.conn.rollback()
+    
+    def optimize_multipliers(self, symbol: str, strategy_name: str, 
+                            recent_trades: List[Dict]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        try:
+            if len(recent_trades) < 10:
+                return None, None, None
+            
+            wins = [t for t in recent_trades if t.get('profit', 0) > 0]
+            losses = [t for t in recent_trades if t.get('profit', 0) < 0]
+            
+            if len(wins) == 0 or len(losses) == 0:
+                return None, None, None
+            
+            avg_win = sum(t.get('profit', 0) for t in wins) / len(wins)
+            avg_loss = abs(sum(t.get('profit', 0) for t in losses) / len(losses))
+            
+            current_multipliers = self.load_strategy_multipliers(symbol, strategy_name)
+            if not current_multipliers:
+                return None, None, None
+            
+            current_sl = current_multipliers['sl_multiplier']
+            current_tp = current_multipliers['tp_multiplier']
+            
+            win_rate = len(wins) / len(recent_trades)
+            
+            learning_rate = 0.05
+            min_sl = 0.3
+            max_sl = 3.0
+            min_tp = 0.5
+            max_tp = 5.0
+            
+            if win_rate > 0.6:
+                new_sl = current_sl * (1 - learning_rate)
+                new_tp = current_tp * (1 + learning_rate * 0.5)
+            elif win_rate < 0.4:
+                new_sl = current_sl * (1 + learning_rate)
+                new_tp = current_tp * (1 - learning_rate * 0.5)
+            else:
+                if avg_win / avg_loss < 1.5:
+                    new_sl = current_sl * (1 - learning_rate * 0.5)
+                    new_tp = current_tp * (1 + learning_rate)
+                else:
+                    new_sl = current_sl * (1 + learning_rate * 0.5)
+                    new_tp = current_tp * (1 - learning_rate * 0.5)
+            
+            new_sl = max(min_sl, min(max_sl, new_sl))
+            new_tp = max(min_tp, min(max_tp, new_tp))
+            
+            min_rr = 1.5
+            if new_tp / new_sl < min_rr:
+                new_tp = new_sl * min_rr
+            
+            return new_sl, new_tp, min_rr
+            
+        except Exception as e:
+            logger.error(f"❌ Error optimizing multipliers: {e}")
+            return None, None, None
+    
+    def save_sl_strategy_weights(self, symbol: str, strategy_name: str, 
+                                 atr_weight: float, node_weight: float):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO sl_strategy_weights 
+                (symbol, strategy_name, atr_weight, node_weight, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (symbol, strategy_name, atr_weight, node_weight))
+            self.conn.commit()
+            logger.debug(f"✅ SL strategy weights saved for {symbol}/{strategy_name}")
+        except Exception as e:
+            logger.error(f"❌ Error saving SL strategy weights: {e}")
+            self.conn.rollback()
+    
+    def load_sl_strategy_weights(self, symbol: str, strategy_name: str) -> Optional[Dict]:
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT atr_weight, node_weight, atr_performance, node_performance, total_trades
+                FROM sl_strategy_weights
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'atr_weight': row['atr_weight'],
+                    'node_weight': row['node_weight'],
+                    'atr_performance': row['atr_performance'] or 0.0,
+                    'node_performance': row['node_performance'] or 0.0,
+                    'total_trades': row['total_trades'] or 0
+                }
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error loading SL strategy weights: {e}")
+            return None
+    
+    def update_sl_strategy_performance(self, symbol: str, strategy_name: str,
+                                      used_method: str, trade_profit: float):
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT atr_performance, node_performance, total_trades
+                FROM sl_strategy_weights
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            
+            if not row:
+                return
+            
+            atr_perf = row['atr_performance'] or 0.0
+            node_perf = row['node_performance'] or 0.0
+            total = row['total_trades'] or 0
+            
+            alpha = 0.1
+            
+            if used_method == 'atr':
+                new_atr_perf = atr_perf * (1 - alpha) + trade_profit * alpha
+                cursor.execute('''
+                    UPDATE sl_strategy_weights
+                    SET atr_performance = ?, total_trades = total_trades + 1
+                    WHERE symbol = ? AND strategy_name = ?
+                ''', (new_atr_perf, symbol, strategy_name))
+            elif used_method == 'node':
+                new_node_perf = node_perf * (1 - alpha) + trade_profit * alpha
+                cursor.execute('''
+                    UPDATE sl_strategy_weights
+                    SET node_performance = ?, total_trades = total_trades + 1
+                    WHERE symbol = ? AND strategy_name = ?
+                ''', (new_node_perf, symbol, strategy_name))
+            
+            self.conn.commit()
+            
+            if total >= 10:
+                self._optimize_sl_strategy_weights(symbol, strategy_name)
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating SL strategy performance: {e}")
+            self.conn.rollback()
+    
+    def _optimize_sl_strategy_weights(self, symbol: str, strategy_name: str):
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT atr_weight, node_weight, atr_performance, node_performance, total_trades
+                FROM sl_strategy_weights
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            
+            if not row:
+                return
+            
+            atr_weight = row['atr_weight']
+            node_weight = row['node_weight']
+            atr_perf = row['atr_performance'] or 0.0
+            node_perf = row['node_performance'] or 0.0
+            
+            learning_rate = 0.05
+            min_weight = 0.1
+            max_weight = 0.9
+            
+            if atr_perf > node_perf:
+                new_atr_weight = min(max_weight, atr_weight * (1 + learning_rate))
+                new_node_weight = max(min_weight, node_weight * (1 - learning_rate))
+            elif node_perf > atr_perf:
+                new_atr_weight = max(min_weight, atr_weight * (1 - learning_rate))
+                new_node_weight = min(max_weight, node_weight * (1 + learning_rate))
+            else:
+                return
+            
+            total = new_atr_weight + new_node_weight
+            new_atr_weight = new_atr_weight / total
+            new_node_weight = new_node_weight / total
+            
+            if abs(new_atr_weight - atr_weight) > 0.01 or abs(new_node_weight - node_weight) > 0.01:
+                cursor.execute('''
+                    UPDATE sl_strategy_weights
+                    SET atr_weight = ?, node_weight = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE symbol = ? AND strategy_name = ?
+                ''', (new_atr_weight, new_node_weight, symbol, strategy_name))
+                self.conn.commit()
+                logger.info(f"🔄 SL strategy weights optimized: ATR {atr_weight:.2f}→{new_atr_weight:.2f}, Node {node_weight:.2f}→{new_node_weight:.2f}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error optimizing SL strategy weights: {e}")
+            self.conn.rollback()
+    
+    def save_timeframe_weights(self, symbol: str, strategy_name: str, 
+                               timeframe_weights: Dict[str, float]):
+        try:
+            cursor = self.conn.cursor()
+            for tf_name, weight in timeframe_weights.items():
+                cursor.execute('''
+                    INSERT OR REPLACE INTO timeframe_weights 
+                    (symbol, strategy_name, timeframe_name, weight, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (symbol, strategy_name, tf_name, weight))
+            self.conn.commit()
+            logger.debug(f"✅ Timeframe weights saved for {symbol}/{strategy_name}")
+        except Exception as e:
+            logger.error(f"❌ Error saving timeframe weights: {e}")
+            self.conn.rollback()
+    
+    def load_timeframe_weights(self, symbol: str, strategy_name: str) -> Dict[str, Dict]:
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT timeframe_name, weight, performance, total_usage
+                FROM timeframe_weights
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            rows = cursor.fetchall()
+            weights = {}
+            for row in rows:
+                weights[row['timeframe_name']] = {
+                    'weight': row['weight'],
+                    'performance': row['performance'] or 0.0,
+                    'total_usage': row['total_usage'] or 0
+                }
+            return weights
+        except Exception as e:
+            logger.error(f"❌ Error loading timeframe weights: {e}")
+            return {}
+    
+    def update_timeframe_performance(self, symbol: str, strategy_name: str,
+                                    used_timeframes: Dict[str, float], trade_profit: float):
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            
+            for tf_name, contribution in used_timeframes.items():
+                cursor.execute('''
+                    SELECT performance, total_usage
+                    FROM timeframe_weights
+                    WHERE symbol = ? AND strategy_name = ? AND timeframe_name = ?
+                ''', (symbol, strategy_name, tf_name))
+                row = cursor.fetchone()
+                
+                if row:
+                    perf = row['performance'] or 0.0
+                    total = row['total_usage'] or 0
+                    alpha = 0.1
+                    new_perf = perf * (1 - alpha) + (trade_profit * contribution) * alpha
+                    
+                    cursor.execute('''
+                        UPDATE timeframe_weights
+                        SET performance = ?, total_usage = total_usage + 1
+                        WHERE symbol = ? AND strategy_name = ? AND timeframe_name = ?
+                    ''', (new_perf, symbol, strategy_name, tf_name))
+                else:
+                    cursor.execute('''
+                        INSERT INTO timeframe_weights 
+                        (symbol, strategy_name, timeframe_name, weight, performance, total_usage)
+                        VALUES (?, ?, ?, 1.0, ?, 1)
+                    ''', (symbol, strategy_name, tf_name, trade_profit * contribution))
+            
+            self.conn.commit()
+            
+            cursor.execute('''
+                SELECT SUM(total_usage) as total
+                FROM timeframe_weights
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            if row and row['total'] and row['total'] >= 20:
+                self._optimize_timeframe_weights(symbol, strategy_name)
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating timeframe performance: {e}")
+            self.conn.rollback()
+    
+    def _optimize_timeframe_weights(self, symbol: str, strategy_name: str):
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT timeframe_name, weight, performance, total_usage
+                FROM timeframe_weights
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            rows = cursor.fetchall()
+            
+            if not rows or len(rows) < 2:
+                return
+            
+            timeframes = {}
+            for row in rows:
+                timeframes[row['timeframe_name']] = {
+                    'weight': row['weight'],
+                    'performance': row['performance'] or 0.0,
+                    'total_usage': row['total_usage'] or 0
+                }
+            
+            learning_rate = 0.05
+            min_weight = 0.3
+            max_weight = 2.0
+            
+            avg_performance = sum(tf['performance'] for tf in timeframes.values()) / len(timeframes)
+            
+            updated = False
+            for tf_name, tf_data in timeframes.items():
+                current_weight = tf_data['weight']
+                performance = tf_data['performance']
+                
+                if performance > avg_performance * 1.1:
+                    new_weight = min(max_weight, current_weight * (1 + learning_rate))
+                elif performance < avg_performance * 0.9:
+                    new_weight = max(min_weight, current_weight * (1 - learning_rate))
+                else:
+                    continue
+                
+                if abs(new_weight - current_weight) > 0.01:
+                    cursor.execute('''
+                        UPDATE timeframe_weights
+                        SET weight = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE symbol = ? AND strategy_name = ? AND timeframe_name = ?
+                    ''', (new_weight, symbol, strategy_name, tf_name))
+                    updated = True
+                    logger.info(f"🔄 Timeframe weight optimized for {symbol}/{strategy_name}: {tf_name} {current_weight:.2f}→{new_weight:.2f}")
+            
+            if updated:
+                self.conn.commit()
+            
+        except Exception as e:
+            logger.error(f"❌ Error optimizing timeframe weights: {e}")
+            self.conn.rollback()
+    
+    def save_risk_management_params(self, symbol: str, strategy_name: str,
+                                    safety_margin_mult: float = 1.0,
+                                    min_sl_dist_mult: float = 2.0,
+                                    trailing_dist_mult: float = 8.0,
+                                    breakeven_trigger: float = 10.0,
+                                    min_confidence: float = 0.6,
+                                    min_rr: float = 1.5,
+                                    stage_10pct: float = 0.10,
+                                    stage_15pct: float = 0.15,
+                                    stage_50pct: float = 0.50,
+                                    stage_70pct: float = 0.70):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO risk_management_params 
+                (symbol, strategy_name, safety_margin_multiplier, min_sl_distance_multiplier,
+                 trailing_distance_multiplier, breakeven_trigger_pips, min_confidence,
+                 min_risk_reward, stage_10pct, stage_15pct_breakeven, stage_50pct_partial,
+                 stage_70pct_partial, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (symbol, strategy_name, safety_margin_mult, min_sl_dist_mult,
+                  trailing_dist_mult, breakeven_trigger, min_confidence, min_rr,
+                  stage_10pct, stage_15pct, stage_50pct, stage_70pct))
+            self.conn.commit()
+            logger.debug(f"✅ Risk management params saved for {symbol}/{strategy_name}")
+        except Exception as e:
+            logger.error(f"❌ Error saving risk management params: {e}")
+            self.conn.rollback()
+    
+    def load_risk_management_params(self, symbol: str, strategy_name: str) -> Optional[Dict]:
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT safety_margin_multiplier, min_sl_distance_multiplier,
+                       trailing_distance_multiplier, breakeven_trigger_pips,
+                       min_confidence, min_risk_reward, stage_10pct,
+                       stage_15pct_breakeven, stage_50pct_partial, stage_70pct_partial,
+                       performance_score, total_trades
+                FROM risk_management_params
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'safety_margin_multiplier': row['safety_margin_multiplier'],
+                    'min_sl_distance_multiplier': row['min_sl_distance_multiplier'],
+                    'trailing_distance_multiplier': row['trailing_distance_multiplier'],
+                    'breakeven_trigger_pips': row['breakeven_trigger_pips'],
+                    'min_confidence': row['min_confidence'],
+                    'min_risk_reward': row['min_risk_reward'],
+                    'stage_10pct': row['stage_10pct'],
+                    'stage_15pct_breakeven': row['stage_15pct_breakeven'],
+                    'stage_50pct_partial': row['stage_50pct_partial'],
+                    'stage_70pct_partial': row['stage_70pct_partial'],
+                    'performance_score': row['performance_score'] or 0.0,
+                    'total_trades': row['total_trades'] or 0
+                }
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error loading risk management params: {e}")
+            return None
+    
+    def update_risk_params_performance(self, symbol: str, strategy_name: str, profit: float):
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT performance_score, total_trades
+                FROM risk_management_params
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            
+            if row:
+                perf = row['performance_score'] or 0.0
+                total = row['total_trades'] or 0
+                alpha = 0.1
+                new_perf = perf * (1 - alpha) + profit * alpha
+                
+                cursor.execute('''
+                    UPDATE risk_management_params
+                    SET performance_score = ?, total_trades = total_trades + 1
+                    WHERE symbol = ? AND strategy_name = ?
+                ''', (new_perf, symbol, strategy_name))
+            else:
+                cursor.execute('''
+                    INSERT INTO risk_management_params 
+                    (symbol, strategy_name, performance_score, total_trades)
+                    VALUES (?, ?, ?, 1)
+                ''', (symbol, strategy_name, profit))
+            
+            self.conn.commit()
+            
+            if row and row['total_trades'] and row['total_trades'] >= 15:
+                self._optimize_risk_management_params(symbol, strategy_name)
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating risk params performance: {e}")
+            self.conn.rollback()
+    
+    def _optimize_risk_management_params(self, symbol: str, strategy_name: str):
+        try:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute('''
+                SELECT safety_margin_multiplier, min_sl_distance_multiplier,
+                       trailing_distance_multiplier, breakeven_trigger_pips,
+                       min_confidence, min_risk_reward, stage_10pct,
+                       stage_15pct_breakeven, stage_50pct_partial, stage_70pct_partial,
+                       performance_score, total_trades
+                FROM risk_management_params
+                WHERE symbol = ? AND strategy_name = ?
+            ''', (symbol, strategy_name))
+            row = cursor.fetchone()
+            
+            if not row:
+                return
+            
+            learning_rate = 0.02
+            perf = row['performance_score'] or 0.0
+            
+            updates = {}
+            
+            if perf > 0:
+                updates['safety_margin_multiplier'] = max(0.5, min(2.0, 
+                    row['safety_margin_multiplier'] * (1 + learning_rate)))
+                updates['min_sl_distance_multiplier'] = max(1.0, min(5.0,
+                    row['min_sl_distance_multiplier'] * (1 + learning_rate)))
+                updates['trailing_distance_multiplier'] = max(5.0, min(15.0,
+                    row['trailing_distance_multiplier'] * (1 + learning_rate)))
+                updates['breakeven_trigger_pips'] = max(5.0, min(20.0,
+                    row['breakeven_trigger_pips'] * (1 + learning_rate)))
+                updates['min_confidence'] = max(0.5, min(0.8,
+                    row['min_confidence'] * (1 + learning_rate)))
+                updates['min_risk_reward'] = max(1.2, min(2.5,
+                    row['min_risk_reward'] * (1 + learning_rate)))
+            else:
+                updates['safety_margin_multiplier'] = max(0.5, min(2.0,
+                    row['safety_margin_multiplier'] * (1 - learning_rate)))
+                updates['min_sl_distance_multiplier'] = max(1.0, min(5.0,
+                    row['min_sl_distance_multiplier'] * (1 - learning_rate)))
+                updates['trailing_distance_multiplier'] = max(5.0, min(15.0,
+                    row['trailing_distance_multiplier'] * (1 - learning_rate)))
+                updates['breakeven_trigger_pips'] = max(5.0, min(20.0,
+                    row['breakeven_trigger_pips'] * (1 - learning_rate)))
+                updates['min_confidence'] = max(0.5, min(0.8,
+                    row['min_confidence'] * (1 - learning_rate)))
+                updates['min_risk_reward'] = max(1.2, min(2.5,
+                    row['min_risk_reward'] * (1 - learning_rate)))
+            
+            updated = False
+            for param_name, new_value in updates.items():
+                old_value = row[param_name]
+                if abs(new_value - old_value) > 0.01:
+                    cursor.execute(f'''
+                        UPDATE risk_management_params
+                        SET {param_name} = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE symbol = ? AND strategy_name = ?
+                    ''', (new_value, symbol, strategy_name))
+                    updated = True
+                    logger.info(f"🔄 Risk param optimized for {symbol}/{strategy_name}: {param_name} {old_value:.2f}→{new_value:.2f}")
+            
+            if updated:
+                self.conn.commit()
+            
+        except Exception as e:
+            logger.error(f"❌ Error optimizing risk management params: {e}")
+            self.conn.rollback()
     
     def close(self):
         if self.conn:
@@ -1081,11 +1736,14 @@ class RiskManager:
         if not signal.is_valid():
             return False, "Invalid signal"
         
-        if signal.risk_reward < 1.5:
-            return False, f"R/R ({signal.risk_reward:.2f}) below 1.5"
+        min_rr = getattr(self, 'risk_params', {}).get('min_risk_reward', 1.5) if hasattr(self, 'risk_params') else 1.5
+        min_conf = getattr(self, 'risk_params', {}).get('min_confidence', 0.6) if hasattr(self, 'risk_params') else 0.6
         
-        if signal.confidence < 0.6:
-            return False, f"Confidence ({signal.confidence:.2f}) below 0.6"
+        if signal.risk_reward < min_rr:
+            return False, f"R/R ({signal.risk_reward:.2f}) below {min_rr}"
+        
+        if signal.confidence < min_conf:
+            return False, f"Confidence ({signal.confidence:.2f}) below {min_conf}"
         
         if signal.stop_loss <= 0 or signal.take_profit <= 0:
             return False, "Invalid SL/TP levels"
@@ -1265,7 +1923,8 @@ class TradeManager:
                 sl_distance = abs(signal.stop_loss - entry_price)
 
             spread = self.mt5.get_spread()
-            min_sl_distance = 2 * spread
+            min_sl_dist_mult = getattr(self, 'risk_params', {}).get('min_sl_distance_multiplier', 2.0) if hasattr(self, 'risk_params') else 2.0
+            min_sl_distance = min_sl_dist_mult * spread
 
             if sl_distance < min_sl_distance:
                 logger.warning(f"⚠️ SL too close to entry - rejecting trade")
@@ -2033,13 +2692,18 @@ class AdvancedGoldenmanAnalyzer:
             spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
             logger.info(f"   Entry: {entry_price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}, Spread={spread:.2f}")
             logger.info(f"   Calculated R/R: {risk_reward:.2f}")
-            if risk_reward < 1.5:
-                logger.info(f"R/R ({risk_reward:.2f}) below 1.5 - waiting for better position")
+            min_rr = getattr(self, 'risk_params', {}).get('min_risk_reward', 1.5) if hasattr(self, 'risk_params') else 1.5
+            if risk_reward < min_rr:
+                logger.info(f"R/R ({risk_reward:.2f}) below {min_rr} - waiting for better position")
                 return None
             
             confidence = self._calculate_confidence(
                 quantum_state, hurst, phase_uncertainty, poly_functions
             )
+            
+            sl_method = 'atr'
+            if hasattr(self, '_last_sl_method'):
+                sl_method = self._last_sl_method
             
             signal = GoldenmanSignal(
                 direction=trend_direction,
@@ -2051,7 +2715,8 @@ class AdvancedGoldenmanAnalyzer:
                 hurst_exponent=hurst,
                 risk_reward=risk_reward,
                 timestamp=datetime.now(),
-                nodes=displaced_nodes[-3:]
+                nodes=displaced_nodes[-3:],
+                sl_method=sl_method
             )
             
             self._log_signal(signal)
@@ -2543,7 +3208,21 @@ class AdvancedGoldenmanAnalyzer:
                 point = self.mt5.get_point()
             elif hasattr(self, 'point'):
                 point = self.point
-            safety_margin = spread + (5 * point)
+            
+            symbol_info = None
+            if hasattr(self, 'mt5') and hasattr(self.mt5, 'symbol'):
+                symbol_info = mt5.symbol_info(self.mt5.symbol)
+            
+            if symbol_info:
+                commission = getattr(symbol_info, 'commission', 0.0) or 0.0
+                if commission > 0 and hasattr(symbol_info, 'trade_contract_size') and symbol_info.trade_contract_size > 0:
+                    commission_points = abs(commission) / (symbol_info.trade_contract_size * point)
+                else:
+                    commission_points = 0.0
+            else:
+                commission_points = 0.0
+            
+            safety_margin = spread + commission_points + (5 * point)
             
             if direction == TrendDirection.BULLISH:
                 entry = current_price
@@ -4667,7 +5346,8 @@ class GoldenmanBot:
                 
                 logger.info(f"📊 Position #{trade.ticket}: Profit={profit_pips:.1f} pips, P/L=${trade.profit:.2f}")
                 
-                if not trade._breakeven_done and profit_pips >= 10:
+                breakeven_trigger = getattr(self, 'risk_params', {}).get('breakeven_trigger_pips', 10.0) if hasattr(self, 'risk_params') else 10.0
+            if not trade._breakeven_done and profit_pips >= breakeven_trigger:
                     if is_buy:
                         new_sl = trade.open_price + (2 * point)
                         if new_sl > trade.sl:
@@ -4680,35 +5360,36 @@ class GoldenmanBot:
                             if self.trade.update_trailing_stop(trade, new_sl):
                                 trade._breakeven_done = True
                                 logger.info(f"🛡️ BREAKEVEN: SL={new_sl:.2f} (+10 pips)")
-                
-                elif profit_pips >= 15:
+            
+            trailing_trigger = getattr(self, 'risk_params', {}).get('trailing_distance_multiplier', 8.0) if hasattr(self, 'risk_params') else 8.0
+            if profit_pips >= trailing_trigger:
+                if not trade._trailing_active:
                     trade._trailing_active = True
+                    logger.info(f"🔥 TRAILING ACTIVATED at {profit_pips:.1f} pips")
+                
+                trailing_dist_mult = getattr(self, 'risk_params', {}).get('trailing_distance_multiplier', 8.0) if hasattr(self, 'risk_params') else 8.0
+                trailing_distance = trailing_dist_mult * point
                     
-                    trailing_distance = 8 * point
+                if is_buy:
+                    new_sl = current_price - trailing_distance
                     
-                    if is_buy:
-
-                        new_sl = current_price - trailing_distance
+                    if new_sl > trade.sl:
+                        sl_improvement_pips = (new_sl - trade.sl) / point
                         
-                        if new_sl > trade.sl:
-                            sl_improvement_pips = (new_sl - trade.sl) / point
-                            
-                            if sl_improvement_pips >= 2:
-                                if self.trade.update_trailing_stop(trade, new_sl):
-                                    logger.info(f"📈 TRAILING: {trade.sl:.2f} → {new_sl:.2f} (+{sl_improvement_pips:.1f} pips)")
-                                    trade._last_trailing_update = current_time
+                        if sl_improvement_pips >= 2:
+                            if self.trade.update_trailing_stop(trade, new_sl):
+                                logger.info(f"📈 TRAILING: {trade.sl:.2f} → {new_sl:.2f} (+{sl_improvement_pips:.1f} pips)")
+                                trade._last_trailing_update = current_time
+                else:
+                    new_sl = current_price + trailing_distance
                     
-                    else:
-
-                        new_sl = current_price + trailing_distance
+                    if new_sl < trade.sl:
+                        sl_improvement_pips = (trade.sl - new_sl) / point
                         
-                        if new_sl < trade.sl:
-                            sl_improvement_pips = (trade.sl - new_sl) / point
-                            
-                            if sl_improvement_pips >= 2:
-                                if self.trade.update_trailing_stop(trade, new_sl):
-                                    logger.info(f"📉 TRAILING: {trade.sl:.2f} → {new_sl:.2f} (+{sl_improvement_pips:.1f} pips)")
-                                    trade._last_trailing_update = current_time
+                        if sl_improvement_pips >= 2:
+                            if self.trade.update_trailing_stop(trade, new_sl):
+                                logger.info(f"📉 TRAILING: {trade.sl:.2f} → {new_sl:.2f} (+{sl_improvement_pips:.1f} pips)")
+                                trade._last_trailing_update = current_time
             
             if not hasattr(self, '_last_trend_check') or \
             (current_time - self._last_trend_check).seconds >= 30:
@@ -5693,7 +6374,8 @@ class ImprovedNodeBasedTrailing:
             logger.debug(f"📊 #{ticket}: Progress {progress_pct:.1f}% | "
                         f"Volume: {pos.volume:.3f} | Price: {current_price:.2f}")
             
-            if not state['stage_10pct'] and progress_pct >= 10:
+            stage_10pct = getattr(self.bot_instance, 'risk_params', {}).get('stage_10pct', 0.10) * 100 if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'risk_params') else 10.0
+            if not state['stage_10pct'] and progress_pct >= stage_10pct:
                 state['stage_10pct'] = True
                 logger.info(f"🔹 STAGE 1: 10% crossed")
                 
@@ -5711,7 +6393,8 @@ class ImprovedNodeBasedTrailing:
                 else:
                     logger.warning(f"   ⚠️ Failed to update SL to node")
             
-            if not state['stage_15pct'] and progress_pct >= 15:
+            stage_15pct = getattr(self.bot_instance, 'risk_params', {}).get('stage_15pct_breakeven', 0.15) * 100 if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'risk_params') else 15.0
+            if not state['stage_15pct'] and progress_pct >= stage_15pct:
                 state['stage_15pct'] = True
                 logger.info(f"🔹 STAGE 2: 15% crossed - BREAKEVEN")
                 
@@ -5728,7 +6411,8 @@ class ImprovedNodeBasedTrailing:
                 else:
                     logger.warning(f"   ⚠️ Failed to update SL to breakeven")
             
-            if not state['stage_50pct'] and progress_pct >= 50:
+            stage_50pct = getattr(self.bot_instance, 'risk_params', {}).get('stage_50pct_partial', 0.50) * 100 if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'risk_params') else 50.0
+            if not state['stage_50pct'] and progress_pct >= stage_50pct:
                 state['stage_50pct'] = True
                 logger.info(f"🔹 STAGE 3: 50% reached")
                 
@@ -5750,7 +6434,8 @@ class ImprovedNodeBasedTrailing:
                     self.update_sl(ticket, new_sl, "50% - Node below market")
                     logger.info(f"   → 50% closed | SL to {new_sl:.2f} (node @ {nearest_node:.2f})")
             
-            if not state['stage_70pct'] and progress_pct >= 70:
+            stage_70pct = getattr(self.bot_instance, 'risk_params', {}).get('stage_70pct_partial', 0.70) * 100 if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'risk_params') else 70.0
+            if not state['stage_70pct'] and progress_pct >= stage_70pct:
                 state['stage_70pct'] = True
                 logger.info(f"🔹 STAGE 4: 70% reached")
                 
@@ -6117,6 +6802,19 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             if hasattr(self.nds, '_current_predictions'):
                 predictions = self.nds._current_predictions.copy()
             
+            sl_method = 'combined'
+            if hasattr(signal, 'sl_method'):
+                sl_method = signal.sl_method
+            
+            tf_names = {
+                'trend_tf': self._get_timeframe_name(self.strategy_config.trend_tf),
+                'coarse_analysis_tf': self._get_timeframe_name(self.strategy_config.coarse_analysis_tf),
+                'fine_analysis_tf': self._get_timeframe_name(self.strategy_config.fine_analysis_tf),
+                'entry_tf': self._get_timeframe_name(self.strategy_config.entry_tf),
+                'exit_signal_tf': self._get_timeframe_name(self.strategy_config.exit_signal_tf),
+                'exit_confirm_tf': self._get_timeframe_name(self.strategy_config.exit_confirm_tf)
+            }
+            
             self.trade_history.append({
                 'ticket': ticket,
                 'entry_time': datetime.now(),
@@ -6124,7 +6822,9 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 'volume': pos.volume,
                 'direction': signal.direction,
                 'signal_confidence': signal.confidence,
-                'predictions': predictions
+                'predictions': predictions,
+                'sl_method': sl_method,
+                'timeframes': tf_names
             })
             
             return ticket
@@ -6249,6 +6949,60 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             
             if hasattr(self, 'db'):
                 self.db.save_analyzer_weights(self.symbol, self.nds.analyzer_weights)
+                
+                sl_method = trade_info.get('sl_method', 'combined')
+                if sl_method == 'atr' or sl_method == 'node':
+                    self.db.update_sl_strategy_performance(
+                        self.symbol, self.strategy_name, sl_method, profit
+                    )
+                
+                timeframes = trade_info.get('timeframes', {})
+                if timeframes:
+                    total_weight = sum(1.0 for _ in timeframes.values())
+                    timeframe_contributions = {tf_name: 1.0 / total_weight for tf_name in timeframes.values()}
+                    self.db.update_timeframe_performance(
+                        self.symbol, self.strategy_name, timeframe_contributions, profit
+                    )
+                
+                self.db.update_risk_params_performance(self.symbol, self.strategy_name, profit)
+                
+                stats = self.db.get_trade_statistics(self.symbol, days=30)
+                if stats:
+                    self.db.update_multiplier_performance(
+                        self.symbol, self.strategy_name, stats
+                    )
+                    
+                    cursor = self.db.conn.cursor()
+                    cursor.execute('''
+                        SELECT ticket, profit, exit_time
+                        FROM trades
+                        WHERE symbol = ? AND strategy_name = ? 
+                        AND exit_time IS NOT NULL
+                        ORDER BY exit_time DESC
+                        LIMIT 20
+                    ''', (self.symbol, self.strategy_name))
+                    rows = cursor.fetchall()
+                    recent_trades = [{'profit': row['profit']} for row in rows]
+                    
+                    if len(recent_trades) >= 10:
+                        new_sl, new_tp, new_rr = self.db.optimize_multipliers(
+                            self.symbol, self.strategy_name, recent_trades
+                        )
+                        if new_sl and new_tp and new_rr:
+                            current = self.db.load_strategy_multipliers(self.symbol, self.strategy_name)
+                            if current:
+                                old_sl = current['sl_multiplier']
+                                old_tp = current['tp_multiplier']
+                                if abs(new_sl - old_sl) > 0.01 or abs(new_tp - old_tp) > 0.01:
+                                    stats = self.db.get_trade_statistics(self.symbol, days=30)
+                                    score = (stats.get('total_profit', 0) * 0.4) + \
+                                           (stats.get('win_rate', 0) * 10 * 0.3) + \
+                                           (stats.get('profit_factor', 0) * 100 * 0.3) if stats else 0
+                                    self.db.save_strategy_multipliers(
+                                        self.symbol, self.strategy_name,
+                                        new_sl, new_tp, new_rr, score
+                                    )
+                                    logger.info(f"🔄 Multipliers optimized: SL {old_sl:.2f}→{new_sl:.2f}, TP {old_tp:.2f}→{new_tp:.2f}")
             
             logger.info(f"📊 RL updated for trade #{ticket}, Profit: ${profit:.2f}, Reward: {reward:.4f}")
             
@@ -6387,7 +7141,8 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 if current_price < trade._peak_price:
                     trade._peak_price = current_price
 
-            if not trade._breakeven_done and profit_pips >= 10:
+            breakeven_trigger = getattr(self, 'risk_params', {}).get('breakeven_trigger_pips', 10.0) if hasattr(self, 'risk_params') else 10.0
+            if not trade._breakeven_done and profit_pips >= breakeven_trigger:
                 if is_buy:
                     breakeven_sl = trade.open_price + spread + (2 * point)
                     
@@ -6406,8 +7161,9 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                             trade.sl = breakeven_sl
                             trade._breakeven_done = True
                             logger.info(f"🛡️ BREAKEVEN: SL={breakeven_sl:.2f}")
-
-            elif profit_pips >= 15:
+            
+            trailing_trigger = getattr(self, 'risk_params', {}).get('trailing_distance_multiplier', 8.0) if hasattr(self, 'risk_params') else 8.0
+            if profit_pips >= trailing_trigger:
                 if not trade._trailing_active:
                     trade._trailing_active = True
                     logger.info(f"🔥 TRAILING ACTIVATED at {profit_pips:.1f} pips")
@@ -6416,7 +7172,8 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 if (current_time - trade._last_trailing_update).seconds < 3:
                     return
                 
-                trailing_distance = 8 * point
+                trailing_dist_mult = getattr(self, 'risk_params', {}).get('trailing_distance_multiplier', 8.0) if hasattr(self, 'risk_params') else 8.0
+                trailing_distance = trailing_dist_mult * point
                 
                 if is_buy:
                     new_sl = current_price - trailing_distance - spread
@@ -6498,6 +7255,37 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
         self._load_analyzer_weights_from_db()
         self.db.cleanup_old_data()
         
+        risk_params = self.db.load_risk_management_params(self.symbol, self.strategy_name)
+        if risk_params:
+            self.risk_params = risk_params
+            logger.info(f"   📊 Loaded risk management params from database")
+        else:
+            self.risk_params = {
+                'safety_margin_multiplier': 1.0,
+                'min_sl_distance_multiplier': 2.0,
+                'trailing_distance_multiplier': 8.0,
+                'breakeven_trigger_pips': 10.0,
+                'min_confidence': 0.6,
+                'min_risk_reward': 1.5,
+                'stage_10pct': 0.10,
+                'stage_15pct_breakeven': 0.15,
+                'stage_50pct_partial': 0.50,
+                'stage_70pct_partial': 0.70
+            }
+            self.db.save_risk_management_params(
+                self.symbol, self.strategy_name,
+                self.risk_params['safety_margin_multiplier'],
+                self.risk_params['min_sl_distance_multiplier'],
+                self.risk_params['trailing_distance_multiplier'],
+                self.risk_params['breakeven_trigger_pips'],
+                self.risk_params['min_confidence'],
+                self.risk_params['min_risk_reward'],
+                self.risk_params['stage_10pct'],
+                self.risk_params['stage_15pct_breakeven'],
+                self.risk_params['stage_50pct_partial'],
+                self.risk_params['stage_70pct_partial']
+            )
+        
         best_strategy, best_symbol = self._select_best_strategy_and_symbol()
         if best_strategy and best_symbol:
             if best_strategy != self.strategy_name:
@@ -6525,6 +7313,51 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
 
         self._exit_signal_logged = {}
         
+        if hasattr(self, 'db'):
+            risk_params = self.db.load_risk_management_params(self.symbol, self.strategy_name)
+            if risk_params:
+                self.risk_params = risk_params
+                logger.info(f"   📊 Loaded risk management params from database")
+            else:
+                self.risk_params = {
+                    'safety_margin_multiplier': 1.0,
+                    'min_sl_distance_multiplier': 2.0,
+                    'trailing_distance_multiplier': 8.0,
+                    'breakeven_trigger_pips': 10.0,
+                    'min_confidence': 0.6,
+                    'min_risk_reward': 1.5,
+                    'stage_10pct': 0.10,
+                    'stage_15pct_breakeven': 0.15,
+                    'stage_50pct_partial': 0.50,
+                    'stage_70pct_partial': 0.70
+                }
+                self.db.save_risk_management_params(
+                    self.symbol, self.strategy_name,
+                    self.risk_params['safety_margin_multiplier'],
+                    self.risk_params['min_sl_distance_multiplier'],
+                    self.risk_params['trailing_distance_multiplier'],
+                    self.risk_params['breakeven_trigger_pips'],
+                    self.risk_params['min_confidence'],
+                    self.risk_params['min_risk_reward'],
+                    self.risk_params['stage_10pct'],
+                    self.risk_params['stage_15pct_breakeven'],
+                    self.risk_params['stage_50pct_partial'],
+                    self.risk_params['stage_70pct_partial']
+                )
+        else:
+            self.risk_params = {
+                'safety_margin_multiplier': 1.0,
+                'min_sl_distance_multiplier': 2.0,
+                'trailing_distance_multiplier': 8.0,
+                'breakeven_trigger_pips': 10.0,
+                'min_confidence': 0.6,
+                'min_risk_reward': 1.5,
+                'stage_10pct': 0.10,
+                'stage_15pct_breakeven': 0.15,
+                'stage_50pct_partial': 0.50,
+                'stage_70pct_partial': 0.70
+            }
+        
         logger.info(f"✅ UnifiedTradingBot initialized with strategy: {self.strategy_config.name}")
         logger.info(f"   Trend TF: {self.strategy_config.trend_tf}")
         logger.info(f"   Coarse Analysis TF: {self.strategy_config.coarse_analysis_tf}")
@@ -6532,6 +7365,18 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
         logger.info(f"   Entry TF: {self.strategy_config.entry_tf}")
         logger.info(f"   Exit Signal TF: {self.strategy_config.exit_signal_tf}")
         logger.info(f"   Exit Confirm TF: {self.strategy_config.exit_confirm_tf}")
+    
+    def _get_timeframe_name(self, timeframe: int) -> str:
+        tf_map = {
+            mt5.TIMEFRAME_M1: 'M1',
+            mt5.TIMEFRAME_M3: 'M3',
+            mt5.TIMEFRAME_M5: 'M5',
+            mt5.TIMEFRAME_M15: 'M15',
+            mt5.TIMEFRAME_H1: 'H1',
+            mt5.TIMEFRAME_H4: 'H4',
+            mt5.TIMEFRAME_D1: 'D1'
+        }
+        return tf_map.get(timeframe, f'TF_{timeframe}')
         
         if not self._is_market_open():
             logger.warning(f"⚠️ Initial symbol {self.symbol} is closed, checking BTCUSD...")
@@ -6721,7 +7566,7 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
         except Exception as e:
             logger.error(f"   ❌ Error setting SL/TP for position #{ticket}: {e}")
     
-    def _calculate_levels_strategy_based(self, direction: TrendDirection, df: pd.DataFrame) -> Tuple[float, float, float]:
+    def _calculate_levels_atr_based(self, direction: TrendDirection, df: pd.DataFrame) -> Tuple[float, float, float]:
 
         try:
             current_price = df['close'].values[-1]
@@ -6730,28 +7575,55 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
             max_atr = current_price * 0.005
             atr = min(atr, max_atr)
             
-            if self.strategy_name == "super_scalping":
-
-                sl_multiplier = 0.5
-                tp_multiplier = 1.0
-                min_rr = 1.5
-            elif self.strategy_name == "scalping":
-
-                sl_multiplier = 1.0
-                tp_multiplier = 2.0
-                min_rr = 1.5
+            saved_multipliers = None
+            if hasattr(self, 'db'):
+                saved_multipliers = self.db.load_strategy_multipliers(self.symbol, self.strategy_name)
+            
+            if saved_multipliers:
+                sl_multiplier = saved_multipliers['sl_multiplier']
+                tp_multiplier = saved_multipliers['tp_multiplier']
+                min_rr = saved_multipliers['min_rr']
+                logger.info(f"   📊 Using learned multipliers from database")
             else:
-
-                sl_multiplier = 1.5
-                tp_multiplier = 3.0
-                min_rr = 1.5
+                if self.strategy_name == "super_scalping":
+                    sl_multiplier = 0.5
+                    tp_multiplier = 1.0
+                    min_rr = 1.5
+                elif self.strategy_name == "scalping":
+                    sl_multiplier = 1.0
+                    tp_multiplier = 2.0
+                    min_rr = 1.5
+                else:
+                    sl_multiplier = 1.5
+                    tp_multiplier = 3.0
+                    min_rr = 1.5
+                
+                if hasattr(self, 'db'):
+                    self.db.save_strategy_multipliers(
+                        self.symbol, self.strategy_name, 
+                        sl_multiplier, tp_multiplier, min_rr
+                    )
             
             logger.info(f"   Strategy: {self.strategy_name}, ATR: {atr:.2f}")
             logger.info(f"   SL Multiplier: {sl_multiplier}x, TP Multiplier: {tp_multiplier}x")
 
             spread = self.mt5.get_spread() if hasattr(self, 'mt5') and hasattr(self.mt5, 'get_spread') else 0
             point = self.mt5.get_point() if hasattr(self, 'mt5') and hasattr(self.mt5, 'get_point') else 0.1
-            safety_margin = spread + (5 * point)
+            
+            symbol_info = mt5.symbol_info(self.symbol)
+            if symbol_info:
+                commission = getattr(symbol_info, 'commission', 0.0) or 0.0
+                if commission > 0 and hasattr(symbol_info, 'trade_contract_size') and symbol_info.trade_contract_size > 0:
+                    commission_points = abs(commission) / (symbol_info.trade_contract_size * point)
+                else:
+                    commission_points = 0.0
+            else:
+                commission_points = 0.0
+            
+            safety_margin_mult = getattr(self, 'risk_params', {}).get('safety_margin_multiplier', 1.0) if hasattr(self, 'risk_params') else 1.0
+            base_safety = spread + commission_points + (5 * point)
+            safety_margin = base_safety * safety_margin_mult
+            logger.info(f"   Safety Margin: Base={base_safety:.2f}, Multiplier={safety_margin_mult:.2f}, Total={safety_margin:.2f}")
             
             if direction == TrendDirection.BULLISH:
                 entry = current_price
@@ -6799,9 +7671,157 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
             return entry, sl, tp
             
         except Exception as e:
-            logger.error(f"Error in _calculate_levels_strategy_based: {e}")
-
+            logger.error(f"Error in _calculate_levels_atr_based: {e}")
             return self.nds._calculate_levels_simple(direction, df)
+    
+    def _calculate_levels_node_based(self, direction: TrendDirection, df: pd.DataFrame) -> Tuple[float, float, float]:
+        
+        try:
+            fine_tf = self.strategy_config.fine_analysis_tf
+            df_fine = self.mt5.get_ohlcv(fine_tf, 200)
+            
+            if df_fine is None or len(df_fine) < 10:
+                logger.warning("   ⚠️ Cannot get fine timeframe data, using ATR fallback")
+                return self._calculate_levels_atr_based(direction, df)
+            
+            nodes_fine = self.nds._detect_nodes(df_fine, fine_tf)
+            
+            if not nodes_fine or len(nodes_fine) < 2:
+                logger.warning("   ⚠️ Not enough nodes detected, using ATR fallback")
+                return self._calculate_levels_atr_based(direction, df)
+            
+            current_price = df['close'].values[-1]
+            
+            spread = self.mt5.get_spread() if hasattr(self, 'mt5') and hasattr(self.mt5, 'get_spread') else 0
+            point = self.mt5.get_point() if hasattr(self, 'mt5') and hasattr(self.mt5, 'get_point') else 0.1
+            
+            symbol_info = mt5.symbol_info(self.symbol)
+            if symbol_info:
+                commission = getattr(symbol_info, 'commission', 0.0) or 0.0
+                if commission > 0 and hasattr(symbol_info, 'trade_contract_size') and symbol_info.trade_contract_size > 0:
+                    commission_points = abs(commission) / (symbol_info.trade_contract_size * point)
+                else:
+                    commission_points = 0.0
+            else:
+                commission_points = 0.0
+            
+            safety_margin = spread + commission_points + (5 * point)
+            
+            node_prices = [node.price for node in nodes_fine]
+            node_prices_below = [p for p in node_prices if p < current_price]
+            node_prices_above = [p for p in node_prices if p > current_price]
+            
+            if direction == TrendDirection.BULLISH:
+                entry = current_price
+                
+                if node_prices_below:
+                    first_node_below = min(node_prices_below, key=lambda x: abs(x - current_price))
+                    sl = first_node_below - safety_margin
+                else:
+                    logger.warning("   ⚠️ No node below for BUY SL, using ATR fallback")
+                    return self._calculate_levels_atr_based(direction, df)
+                
+                if node_prices_above:
+                    last_node_above = max(node_prices_above)
+                    tp = last_node_above - safety_margin
+                else:
+                    logger.warning("   ⚠️ No node above for BUY TP, using ATR fallback")
+                    return self._calculate_levels_atr_based(direction, df)
+                
+                if sl >= entry or tp <= entry:
+                    logger.warning("   ⚠️ Invalid node-based levels, using ATR fallback")
+                    return self._calculate_levels_atr_based(direction, df)
+                
+                rr = abs(tp - entry) / abs(entry - sl)
+                logger.info(f"   BUY (Node-based): Entry={entry:.2f}, SL={sl:.2f} (node @ {first_node_below:.2f}), TP={tp:.2f} (node @ {last_node_above:.2f}), R/R={rr:.2f}")
+            
+            elif direction == TrendDirection.BEARISH:
+                entry = current_price
+                
+                if node_prices_above:
+                    first_node_above = min(node_prices_above, key=lambda x: abs(x - current_price))
+                    sl = first_node_above + safety_margin
+                else:
+                    logger.warning("   ⚠️ No node above for SELL SL, using ATR fallback")
+                    return self._calculate_levels_atr_based(direction, df)
+                
+                if node_prices_below:
+                    last_node_below = max(node_prices_below)
+                    tp = last_node_below + safety_margin
+                else:
+                    logger.warning("   ⚠️ No node below for SELL TP, using ATR fallback")
+                    return self._calculate_levels_atr_based(direction, df)
+                
+                if sl <= entry or tp >= entry:
+                    logger.warning("   ⚠️ Invalid node-based levels, using ATR fallback")
+                    return self._calculate_levels_atr_based(direction, df)
+                
+                rr = abs(entry - tp) / abs(sl - entry)
+                logger.info(f"   SELL (Node-based): Entry={entry:.2f}, SL={sl:.2f} (node @ {first_node_above:.2f}), TP={tp:.2f} (node @ {last_node_below:.2f}), R/R={rr:.2f}")
+            
+            else:
+                return 0.0, 0.0, 0.0
+            
+            return entry, sl, tp
+            
+        except Exception as e:
+            logger.error(f"Error in _calculate_levels_node_based: {e}")
+            return self._calculate_levels_atr_based(direction, df)
+    
+    def _calculate_levels_strategy_based(self, direction: TrendDirection, df: pd.DataFrame) -> Tuple[float, float, float]:
+        
+        try:
+            if hasattr(self, 'db'):
+                weights = self.db.load_sl_strategy_weights(self.symbol, self.strategy_name)
+                if weights:
+                    atr_weight = weights.get('atr_weight', 0.5)
+                    node_weight = weights.get('node_weight', 0.5)
+                else:
+                    atr_weight = 0.5
+                    node_weight = 0.5
+                    self.db.save_sl_strategy_weights(self.symbol, self.strategy_name, atr_weight, node_weight)
+            else:
+                atr_weight = 0.5
+                node_weight = 0.5
+            
+            entry_atr, sl_atr, tp_atr = self._calculate_levels_atr_based(direction, df)
+            entry_node, sl_node, tp_node = self._calculate_levels_node_based(direction, df)
+            
+            if entry_atr == 0 or entry_node == 0:
+                if entry_atr > 0:
+                    return entry_atr, sl_atr, tp_atr
+                elif entry_node > 0:
+                    return entry_node, sl_node, tp_node
+                else:
+                    return 0.0, 0.0, 0.0
+            
+            total_weight = atr_weight + node_weight
+            if total_weight > 0:
+                entry = entry_atr * (atr_weight / total_weight) + entry_node * (node_weight / total_weight)
+                sl = sl_atr * (atr_weight / total_weight) + sl_node * (node_weight / total_weight)
+                tp = tp_atr * (atr_weight / total_weight) + tp_node * (node_weight / total_weight)
+                sl_method_used = 'combined'
+            else:
+                entry = (entry_atr + entry_node) / 2
+                sl = (sl_atr + sl_node) / 2
+                tp = (tp_atr + tp_node) / 2
+                sl_method_used = 'combined'
+            
+            if abs(sl - sl_atr) < abs(sl - sl_node) * 0.8:
+                sl_method_used = 'atr'
+            elif abs(sl - sl_node) < abs(sl - sl_atr) * 0.8:
+                sl_method_used = 'node'
+            
+            self._last_sl_method = sl_method_used
+            
+            rr = abs(tp - entry) / abs(entry - sl) if direction == TrendDirection.BULLISH else abs(entry - tp) / abs(sl - entry)
+            logger.info(f"   Combined (ATR: {atr_weight:.2f}, Node: {node_weight:.2f}): Entry={entry:.2f}, SL={sl:.2f}, TP={tp:.2f}, R/R={rr:.2f}, Method={sl_method_used}")
+            
+            return entry, sl, tp
+            
+        except Exception as e:
+            logger.error(f"Error in _calculate_levels_strategy_based: {e}")
+            return self._calculate_levels_atr_based(direction, df)
     
     def _get_main_trend(self) -> TrendDirection:
         try:
