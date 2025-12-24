@@ -2023,16 +2023,10 @@ class TradeManager:
                 logger.info(f"   SL: {pos.sl:.2f}")
                 logger.info(f"   TP: {pos.tp:.2f}")
                 logger.info(f"   Profit: ${pos.profit:.2f}")
-                logger.info(f"   Swap: ${pos.swap:.2f}")
-                logger.info(f"   Commission: ${pos.commission:.2f}")
-
+                logger.info(f"   Swap: ${getattr(pos, 'swap', 0.0):.2f}")
+                
                 commission = getattr(pos, 'commission', 0.0)
                 logger.info(f"   Commission: ${commission:.2f}")
-                    
-                if hasattr(pos, 'commission'):
-                    logger.info(f"   Commission: ${pos.commission:.2f}")
-                else:
-                    logger.info(f"   Commission: N/A")
         
         except Exception as e:
             logger.error(f"Error logging position info: {e}")
@@ -2167,8 +2161,8 @@ class TradeManager:
                 "sl": position.sl,
                 "tp": position.tp,
                 "profit": position.profit,
-                "commission": position.commission,
-                "swap": position.swap,
+                "commission": getattr(position, 'commission', 0.0),
+                "swap": getattr(position, 'swap', 0.0),
             }
             
             logger.info("📋 Trade Verification:")
@@ -6217,6 +6211,13 @@ class ImprovedNodeBasedTrailing:
             return current_price - (30 * self.point)
         return max(valid)
     
+    def get_nearest_node_above_market(self, current_price: float, nodes: list) -> float:
+
+        valid = [n for n in nodes if n > current_price]
+        if not valid:
+            return current_price + (30 * self.point)
+        return min(valid)
+    
     def calculate_profit_distance_percent(self, entry: float, current: float,
                                           tp: float, direction: str) -> float:
         
@@ -6276,11 +6277,21 @@ class ImprovedNodeBasedTrailing:
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 logger.info(f"✅ PARTIAL CLOSE: {close_volume:.3f} lots @ {close_price:.2f}")
                 logger.info(f"   Reason: {reason}")
-                logger.info(f"   Remaining: {(pos.volume - close_volume):.3f} lots")
                 
-                if ticket in self.trade_states:
-                    state = self.trade_states[ticket]
-                    state['total_closed_volume'] += close_volume
+                updated_positions = mt5.positions_get(ticket=ticket)
+                if updated_positions:
+                    remaining_vol = updated_positions[0].volume
+                    logger.info(f"   Remaining: {remaining_vol:.3f} lots")
+                    
+                    if ticket in self.trade_states:
+                        state = self.trade_states[ticket]
+                        state['total_closed_volume'] = state.get('total_closed_volume', 0.0) + close_volume
+                        state['current_volume'] = remaining_vol
+                else:
+                    logger.warning(f"   ⚠️ Position not found after partial close - may be fully closed")
+                    if ticket in self.trade_states:
+                        state = self.trade_states[ticket]
+                        state['total_closed_volume'] = state.get('total_closed_volume', 0.0) + close_volume
                     state['current_volume'] = pos.volume - close_volume
                     
                     profit_per_lot = pos.profit / pos.volume if pos.volume > 0 else 0
@@ -6304,6 +6315,10 @@ class ImprovedNodeBasedTrailing:
             
             pos = positions[0]
             
+            if abs(new_sl - pos.sl) < 0.01:
+                logger.debug(f"⏸️ SL unchanged: {new_sl:.2f} == current SL {pos.sl:.2f}")
+                return True
+            
             symbol_info = mt5.symbol_info(self.symbol)
             min_distance = max(symbol_info.trade_stops_level * self.point, 10 * self.point)
             
@@ -6311,11 +6326,11 @@ class ImprovedNodeBasedTrailing:
             
             if pos.type == mt5.ORDER_TYPE_BUY:
                 if new_sl >= current_price - min_distance:
-                    logger.debug(f"⚠️ SL too close for BUY: {new_sl:.2f} vs {current_price:.2f}")
+                    logger.debug(f"⚠️ SL too close for BUY: {new_sl:.2f} vs {current_price:.2f} (needs {min_distance:.2f} distance)")
                     return False
             else:
                 if new_sl <= current_price + min_distance:
-                    logger.debug(f"⚠️ SL too close for SELL: {new_sl:.2f} vs {current_price:.2f}")
+                    logger.debug(f"⚠️ SL too close for SELL: {new_sl:.2f} vs {current_price:.2f} (needs {min_distance:.2f} distance)")
                     return False
             
             request = {
@@ -6346,9 +6361,11 @@ class ImprovedNodeBasedTrailing:
                 if pos.type == mt5.ORDER_TYPE_BUY:
                     distance_check = new_sl >= current_price - min_distance
                     logger.warning(f"   📊 BUY Check: new_sl ({new_sl:.2f}) >= current_price - min_distance ({current_price - min_distance:.2f})? {distance_check}")
+                    logger.warning(f"   📊 Actual Distance: {current_price - new_sl:.2f} points (needs {min_distance:.2f})")
                 else:
                     distance_check = new_sl <= current_price + min_distance
                     logger.warning(f"   📊 SELL Check: new_sl ({new_sl:.2f}) <= current_price + min_distance ({current_price + min_distance:.2f})? {distance_check}")
+                    logger.warning(f"   📊 Actual Distance: {new_sl - current_price:.2f} points (needs {min_distance:.2f})")
                 return False
                 
         except Exception as e:
@@ -6461,18 +6478,45 @@ class ImprovedNodeBasedTrailing:
                 state['stage_10pct'] = True
                 logger.info(f"🔹 STAGE 1: 10% crossed")
                 
-                last_node = self.get_last_node_below(state['entry_price'], 
-                                                     state['nodes']['below_entry'])
                 spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
                 safety_margin = spread + (5 * self.point)
+                
+                symbol_info = mt5.symbol_info(self.symbol)
+                min_distance = max(symbol_info.trade_stops_level * self.point, 10 * self.point) if symbol_info else (10 * self.point)
+                
+                node_used = None
                 if state['direction'] == 'BUY':
+                    last_node = self.get_last_node_below(state['entry_price'], 
+                                                         state['nodes']['below_entry'])
                     new_sl = last_node - safety_margin
+                    node_used = last_node
                 else:
-                    new_sl = last_node + safety_margin
+                    if current_price < state['entry_price']:
+                        nearest_node_above = self.get_nearest_node_above_market(current_price, state['nodes']['all'])
+                        if nearest_node_above and nearest_node_above > current_price:
+                            new_sl = nearest_node_above + safety_margin
+                            node_used = nearest_node_above
+                            logger.info(f"   📊 Using nearest node above current price: {nearest_node_above:.2f}")
+                        else:
+                            min_sl = current_price + min_distance
+                            new_sl = min_sl + safety_margin
+                            node_used = current_price + min_distance
+                            logger.warning(f"   ⚠️ No node above current price, using min SL: {new_sl:.2f}")
+                    else:
+                        last_node = self.get_last_node_below(state['entry_price'], 
+                                                             state['nodes']['below_entry'])
+                        new_sl = last_node + safety_margin
+                        node_used = last_node
                 
                 logger.info(f"📊 Node-based SL Calculation:")
                 logger.info(f"   Direction: {state['direction']}")
-                logger.info(f"   Last Node Below Entry: {last_node:.2f}")
+                if state['direction'] == 'BUY':
+                    logger.info(f"   Last Node Below Entry: {node_used:.2f}")
+                else:
+                    if current_price < state['entry_price']:
+                        logger.info(f"   Nearest Node Above Current: {node_used:.2f}")
+                    else:
+                        logger.info(f"   Last Node Below Entry: {node_used:.2f}")
                 logger.info(f"   Safety Margin: {safety_margin:.2f}")
                 logger.info(f"   Calculated SL: {new_sl:.2f}")
                 logger.info(f"   Current SL: {state.get('current_sl', 0):.2f}")
@@ -6491,17 +6535,18 @@ class ImprovedNodeBasedTrailing:
                             logger.warning(f"   ⏸️ Skipping SL update - too close to current price")
                             return
                     else:
-                        max_allowed_sl = current_price + min_distance
-                        if new_sl <= max_allowed_sl:
+                        min_allowed_sl = current_price + min_distance
+                        if new_sl <= min_allowed_sl:
                             logger.warning(f"   ⚠️ Calculated SL too close to current price")
                             logger.warning(f"   📊 Calculated SL: {new_sl:.2f}")
-                            logger.warning(f"   📊 Max Allowed SL: {max_allowed_sl:.2f} (current + {min_distance:.2f})")
+                            logger.warning(f"   📊 Min Allowed SL: {min_allowed_sl:.2f} (current + {min_distance:.2f})")
                             logger.warning(f"   📊 Distance: {new_sl - current_price:.2f} points (needs {min_distance:.2f})")
                             logger.warning(f"   ⏸️ Skipping SL update - too close to current price")
                             return
                 
-                if self.update_sl(ticket, new_sl, "10% - Last node below entry"):
-                    logger.info(f"   ✅ SL updated to {new_sl:.2f} (node @ {last_node:.2f})")
+                reason_text = "10% - Node based" if node_used else "10% - Last node below entry"
+                if self.update_sl(ticket, new_sl, reason_text):
+                    logger.info(f"   ✅ SL updated to {new_sl:.2f} (node @ {node_used:.2f})")
                 else:
                     logger.warning(f"   ⚠️ Failed to update SL to node")
                     logger.warning(f"   📊 Calculated SL: {new_sl:.2f}, Current Price: {current_price:.2f}")
@@ -6646,18 +6691,38 @@ class ImprovedNodeBasedTrailing:
                 
                 if self.partial_close(ticket, close_vol, "50%_profit"):
                     
-                    nearest_node = self.get_nearest_node_below_market(
-                        current_price,
-                        state['nodes']['all']
-                    )
                     spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
                     safety_margin = spread + (5 * self.point)
+                    
+                    symbol_info_temp = mt5.symbol_info(self.symbol)
+                    min_distance_temp = max(symbol_info_temp.trade_stops_level * self.point, 10 * self.point) if symbol_info_temp else (10 * self.point)
+                    
                     if state['direction'] == 'BUY':
+                        nearest_node = self.get_nearest_node_below_market(
+                            current_price,
+                            state['nodes']['all']
+                        )
                         new_sl = nearest_node - safety_margin
                     else:
-                        new_sl = nearest_node + safety_margin
+                        if current_price < state['entry_price']:
+                            nearest_node = self.get_nearest_node_above_market(
+                                current_price,
+                                state['nodes']['all']
+                            )
+                            if nearest_node and nearest_node > current_price:
+                                new_sl = nearest_node + safety_margin
+                            else:
+                                min_sl = current_price + min_distance_temp
+                                new_sl = min_sl + safety_margin
+                                logger.warning(f"   ⚠️ No node above current price, using min SL: {new_sl:.2f}")
+                        else:
+                            nearest_node = self.get_nearest_node_below_market(
+                                current_price,
+                                state['nodes']['all']
+                            )
+                            new_sl = nearest_node + safety_margin
                     
-                    self.update_sl(ticket, new_sl, "50% - Node below market")
+                    self.update_sl(ticket, new_sl, "50% - Node based")
                     logger.info(f"   → 50% closed | SL to {new_sl:.2f} (node @ {nearest_node:.2f})")
             
             stage_70pct = getattr(self.bot_instance, 'risk_params', {}).get('stage_70pct_partial', 0.70) * 100 if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'risk_params') else 70.0
@@ -6670,33 +6735,84 @@ class ImprovedNodeBasedTrailing:
                 
                 if self.partial_close(ticket, close_vol, "70%_profit"):
                     
+                    entry_price = state['entry_price']
+                    tp_price = state['initial_tp']
+                    
+                    if state['direction'] == 'BUY':
+                        price_at_50pct = entry_price + 0.50 * (tp_price - entry_price)
+                        spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
+                        commission = state.get('commission', 0.0)
+                        safety_margin = spread + commission + (5 * self.point)
+                        new_sl = price_at_50pct - safety_margin
+                    else:
+                        price_at_50pct = entry_price - 0.50 * (entry_price - tp_price)
+                        spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
+                        commission = state.get('commission', 0.0)
+                        safety_margin = spread + commission + (5 * self.point)
+                        new_sl = price_at_50pct + safety_margin
+                    
+                    logger.info(f"📊 50% Progress Price Calculation:")
+                    logger.info(f"   Entry: {entry_price:.2f}, TP: {tp_price:.2f}")
+                    logger.info(f"   Price at 50%: {price_at_50pct:.2f}")
+                    logger.info(f"   Safety Margin: {safety_margin:.2f} (spread + commission + 5 points)")
+                    logger.info(f"   Calculated SL: {new_sl:.2f}")
+                    
+                    symbol_info = mt5.symbol_info(self.symbol)
+                    if symbol_info:
+                        min_distance = max(symbol_info.trade_stops_level * self.point, 10 * self.point)
+                        if state['direction'] == 'BUY':
+                            min_allowed_sl = current_price - min_distance
+                            if new_sl >= min_allowed_sl:
+                                logger.warning(f"   ⚠️ Calculated SL too close to current price")
+                                logger.warning(f"   📊 Calculated SL: {new_sl:.2f}")
+                                logger.warning(f"   📊 Min Allowed SL: {min_allowed_sl:.2f} (current - {min_distance:.2f})")
+                                logger.warning(f"   📊 Distance: {current_price - new_sl:.2f} points (needs {min_distance:.2f})")
+                                logger.warning(f"   ⏸️ Skipping SL update - too close to current price")
+                                return
+                        else:
+                            max_allowed_sl = current_price - min_distance
+                            if new_sl >= max_allowed_sl:
+                                logger.warning(f"   ⚠️ Calculated SL too close to current price")
+                                logger.warning(f"   📊 Calculated SL: {new_sl:.2f}")
+                                logger.warning(f"   📊 Max Allowed SL: {max_allowed_sl:.2f} (current - {min_distance:.2f})")
+                                logger.warning(f"   📊 Distance: {current_price - new_sl:.2f} points (needs {min_distance:.2f})")
+                                logger.warning(f"   ⏸️ Skipping SL update - too close to current price")
+                                return
+                    
+                    self.update_sl(ticket, new_sl, "70% - Trail to 50% progress")
+                    logger.info(f"   → 30% closed | 20% remaining to TP")
+                    logger.info(f"   → SL trailed to 50% progress: {new_sl:.2f} (50% price: {price_at_50pct:.2f})")
+            
+            if state['stage_70pct'] and progress_pct >= 70:
+
+                symbol_info_temp = mt5.symbol_info(self.symbol)
+                min_distance_temp = max(symbol_info_temp.trade_stops_level * self.point, 10 * self.point) if symbol_info_temp else (10 * self.point)
+                
+                if state['direction'] == 'BUY':
                     nearest_node = self.get_nearest_node_below_market(
                         current_price,
                         state['nodes']['all']
                     )
-                    spread = self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0
-                    safety_margin = spread + (5 * self.point)
-                    if state['direction'] == 'BUY':
-                        new_sl = nearest_node - safety_margin
-                    else:
-                        new_sl = nearest_node + safety_margin
-                    
-                    self.update_sl(ticket, new_sl, "70% - Node below market")
-                    logger.info(f"   → 30% closed | 20% remaining to TP")
-                    logger.info(f"   → SL to {new_sl:.2f} (node @ {nearest_node:.2f})")
-            
-            if state['stage_70pct'] and progress_pct >= 70:
-
-                nearest_node = self.get_nearest_node_below_market(
-                    current_price,
-                    state['nodes']['all']
-                )
-                new_sl = nearest_node - (10 * self.point)
-                
-                if state['direction'] == 'BUY':
+                    new_sl = nearest_node - (10 * self.point)
                     if new_sl > pos.sl + (20 * self.point):
                         self.update_sl(ticket, new_sl, f"Trailing to node @ {nearest_node:.2f}")
                 else:
+                    if current_price < state['entry_price']:
+                        nearest_node = self.get_nearest_node_above_market(
+                            current_price,
+                            state['nodes']['all']
+                        )
+                        if nearest_node and nearest_node > current_price:
+                            new_sl = nearest_node + (10 * self.point)
+                        else:
+                            new_sl = current_price + min_distance_temp + (10 * self.point)
+                    else:
+                        nearest_node = self.get_nearest_node_below_market(
+                            current_price,
+                            state['nodes']['all']
+                        )
+                        new_sl = nearest_node + (10 * self.point)
+                    
                     if new_sl < pos.sl - (20 * self.point):
                         self.update_sl(ticket, new_sl, f"Trailing to node @ {nearest_node:.2f}")
                         
