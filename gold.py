@@ -17,6 +17,8 @@ from scipy.stats import norm
 import threading
 from collections import deque
 import requests
+import sqlite3
+import json
 
 try:
     from config import BotConfig, get_config
@@ -336,6 +338,391 @@ class TelegramNotifier:
         
         if self.last_trade_info and self.last_trade_info['ticket'] == ticket:
             self.last_trade_info = None
+    
+    def send_daily_report(self, db: 'DatabaseManager'):
+        try:
+            best_strategy, best_symbol, all_stats = db.get_best_strategy_and_symbol(days=30)
+            
+            message = f"""
+📊 <b>Daily Performance Report</b>
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+🎯 <b>Recommended Configuration:</b>
+"""
+            
+            if best_strategy and best_symbol:
+                best_stats = all_stats.get(f"{best_symbol}_{best_strategy}", {})
+                message += f"""
+✅ <b>Best Strategy:</b> <code>{best_strategy}</code>
+✅ <b>Best Symbol:</b> <code>{best_symbol}</code>
+📈 <b>Score:</b> <code>{best_stats.get('score', 0):.2f}</code>
+💰 <b>Total Profit:</b> <code>${best_stats.get('total_profit', 0):.2f}</code>
+📊 <b>Win Rate:</b> <code>{best_stats.get('win_rate', 0):.1f}%</code>
+🎲 <b>Profit Factor:</b> <code>{best_stats.get('profit_factor', 0):.2f}</code>
+📝 <b>Total Trades:</b> <code>{best_stats.get('total_trades', 0)}</code>
+"""
+            else:
+                message += """
+⚠️ <b>No sufficient data available</b>
+   Need at least 5 completed trades per strategy/symbol
+"""
+            
+            message += "\n📋 <b>All Strategies Performance (Last 30 Days):</b>\n"
+            
+            sorted_stats = sorted(all_stats.items(), key=lambda x: x[1].get('score', 0), reverse=True)
+            for i, (key, stats) in enumerate(sorted_stats[:5], 1):
+                message += f"""
+{i}. <b>{stats['symbol']}</b> - <code>{stats['strategy']}</code>
+   💰 ${stats['total_profit']:.2f} | 📊 {stats['win_rate']:.1f}% | 🎲 {stats['profit_factor']:.2f} | 📝 {stats['total_trades']} trades
+"""
+            
+            if not sorted_stats:
+                message += "\n   No data available yet"
+            
+            self.send_message(message)
+            
+        except Exception as e:
+            logger.error(f"❌ Error sending daily report: {e}")
+
+class DatabaseManager:
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            self.db_path = os.path.join(script_dir, "goldenman.db")
+        else:
+            self.db_path = db_path
+        self.conn = None
+        self._init_database()
+    
+    def _init_database(self):
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self._create_tables()
+            logger.info(f"✅ Database initialized: {self.db_path}")
+        except Exception as e:
+            logger.error(f"❌ Database initialization error: {e}")
+            raise
+    
+    def _create_tables(self):
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket INTEGER UNIQUE NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL,
+                sl_initial REAL,
+                tp_initial REAL,
+                sl_final REAL,
+                tp_final REAL,
+                volume REAL NOT NULL,
+                profit REAL,
+                commission REAL,
+                swap REAL,
+                entry_time TIMESTAMP NOT NULL,
+                exit_time TIMESTAMP,
+                close_reason TEXT,
+                strategy_name TEXT,
+                confidence REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analyzer_weights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                weight_name TEXT NOT NULL,
+                weight_value REAL NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, weight_name)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket INTEGER,
+                symbol TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (ticket) REFERENCES trades(ticket)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS statistics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                date DATE NOT NULL,
+                total_trades INTEGER,
+                winning_trades INTEGER,
+                losing_trades INTEGER,
+                total_profit REAL,
+                win_rate REAL,
+                profit_factor REAL,
+                max_drawdown REAL,
+                sharpe_ratio REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, date)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                error_type TEXT NOT NULL,
+                error_message TEXT,
+                error_traceback TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_weights_symbol ON analyzer_weights(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_journal_ticket ON trade_journal(ticket)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_journal_symbol ON trade_journal(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_statistics_symbol_date ON statistics(symbol, date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_errors_timestamp ON errors(timestamp)')
+        
+        self.conn.commit()
+    
+    def save_analyzer_weights(self, symbol: str, weights: Dict[str, float]):
+        try:
+            cursor = self.conn.cursor()
+            for weight_name, weight_value in weights.items():
+                cursor.execute('''
+                    INSERT OR REPLACE INTO analyzer_weights (symbol, weight_name, weight_value, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (symbol, weight_name, weight_value))
+            self.conn.commit()
+            logger.debug(f"✅ Analyzer weights saved for {symbol}")
+        except Exception as e:
+            logger.error(f"❌ Error saving analyzer weights: {e}")
+            self.conn.rollback()
+    
+    def load_analyzer_weights(self, symbol: str) -> Optional[Dict[str, float]]:
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT weight_name, weight_value FROM analyzer_weights
+                WHERE symbol = ?
+            ''', (symbol,))
+            rows = cursor.fetchall()
+            if rows:
+                weights = {row['weight_name']: row['weight_value'] for row in rows}
+                logger.info(f"✅ Analyzer weights loaded for {symbol}: {len(weights)} weights")
+                return weights
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error loading analyzer weights: {e}")
+            return None
+    
+    def save_trade(self, ticket: int, symbol: str, direction: str, entry_price: float,
+                   volume: float, sl_initial: float, tp_initial: float,
+                   strategy_name: str = None, confidence: float = None):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO trades 
+                (ticket, symbol, direction, entry_price, volume, sl_initial, tp_initial,
+                 strategy_name, confidence, entry_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (ticket, symbol, direction, entry_price, volume, sl_initial, tp_initial,
+                  strategy_name, confidence))
+            self.conn.commit()
+            logger.debug(f"✅ Trade saved: #{ticket}")
+        except Exception as e:
+            logger.error(f"❌ Error saving trade: {e}")
+            self.conn.rollback()
+    
+    def update_trade_close(self, ticket: int, exit_price: float, profit: float,
+                          commission: float = 0.0, swap: float = 0.0,
+                          close_reason: str = None, sl_final: float = None,
+                          tp_final: float = None):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE trades
+                SET exit_price = ?, profit = ?, commission = ?, swap = ?,
+                    exit_time = CURRENT_TIMESTAMP, close_reason = ?,
+                    sl_final = COALESCE(?, sl_final), tp_final = COALESCE(?, tp_final)
+                WHERE ticket = ?
+            ''', (exit_price, profit, commission, swap, close_reason, sl_final, tp_final, ticket))
+            self.conn.commit()
+            logger.debug(f"✅ Trade closed updated: #{ticket}")
+        except Exception as e:
+            logger.error(f"❌ Error updating trade close: {e}")
+            self.conn.rollback()
+    
+    def add_journal_entry(self, ticket: int, symbol: str, event_type: str, event_data: Dict = None):
+        try:
+            cursor = self.conn.cursor()
+            event_data_json = json.dumps(event_data) if event_data else None
+            cursor.execute('''
+                INSERT INTO trade_journal (ticket, symbol, event_type, event_data)
+                VALUES (?, ?, ?, ?)
+            ''', (ticket, symbol, event_type, event_data_json))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Error adding journal entry: {e}")
+            self.conn.rollback()
+    
+    def cleanup_old_data(self):
+        try:
+            cursor = self.conn.cursor()
+            
+            six_months_ago = datetime.now() - timedelta(days=180)
+            three_months_ago = datetime.now() - timedelta(days=90)
+            
+            cursor.execute('''
+                DELETE FROM trade_journal
+                WHERE timestamp < ?
+            ''', (three_months_ago,))
+            journal_deleted = cursor.rowcount
+            
+            cursor.execute('''
+                DELETE FROM errors
+                WHERE timestamp < ?
+            ''', (six_months_ago,))
+            errors_deleted = cursor.rowcount
+            
+            cursor.execute('''
+                DELETE FROM trades
+                WHERE exit_time IS NOT NULL AND exit_time < ?
+            ''', (six_months_ago,))
+            trades_deleted = cursor.rowcount
+            
+            self.conn.commit()
+            
+            if journal_deleted > 0 or errors_deleted > 0 or trades_deleted > 0:
+                logger.info(f"🧹 Cleanup completed: {trades_deleted} trades, {journal_deleted} journal entries, {errors_deleted} errors deleted")
+            
+        except Exception as e:
+            logger.error(f"❌ Error during cleanup: {e}")
+            self.conn.rollback()
+    
+    def get_trade_statistics(self, symbol: str, days: int = 30) -> Dict:
+        try:
+            cursor = self.conn.cursor()
+            start_date = datetime.now() - timedelta(days=days)
+            
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(CASE WHEN profit < 0 THEN 1 ELSE 0 END) as losing_trades,
+                    SUM(profit) as total_profit,
+                    AVG(CASE WHEN profit > 0 THEN profit ELSE NULL END) as avg_win,
+                    AVG(CASE WHEN profit < 0 THEN profit ELSE NULL END) as avg_loss
+                FROM trades
+                WHERE symbol = ? AND exit_time >= ? AND exit_time IS NOT NULL
+            ''', (symbol, start_date))
+            
+            row = cursor.fetchone()
+            if row and row['total_trades']:
+                total = row['total_trades']
+                wins = row['winning_trades'] or 0
+                losses = row['losing_trades'] or 0
+                win_rate = (wins / total * 100) if total > 0 else 0
+                avg_win = row['avg_win'] or 0
+                avg_loss = abs(row['avg_loss'] or 1)
+                profit_factor = (avg_win / avg_loss) if avg_loss > 0 else 0
+                
+                return {
+                    'total_trades': total,
+                    'winning_trades': wins,
+                    'losing_trades': losses,
+                    'total_profit': row['total_profit'] or 0,
+                    'win_rate': win_rate,
+                    'profit_factor': profit_factor,
+                    'avg_win': avg_win,
+                    'avg_loss': row['avg_loss'] or 0
+                }
+            return {}
+        except Exception as e:
+            logger.error(f"❌ Error getting statistics: {e}")
+            return {}
+    
+    def get_best_strategy_and_symbol(self, days: int = 30) -> Tuple[Optional[str], Optional[str], Dict]:
+        try:
+            cursor = self.conn.cursor()
+            start_date = datetime.now() - timedelta(days=days)
+            
+            cursor.execute('''
+                SELECT 
+                    symbol,
+                    strategy_name,
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(profit) as total_profit,
+                    AVG(CASE WHEN profit > 0 THEN profit ELSE NULL END) as avg_win,
+                    AVG(CASE WHEN profit < 0 THEN profit ELSE NULL END) as avg_loss
+                FROM trades
+                WHERE exit_time >= ? AND exit_time IS NOT NULL
+                GROUP BY symbol, strategy_name
+                HAVING total_trades >= 5
+            ''', (start_date,))
+            
+            rows = cursor.fetchall()
+            if not rows:
+                return None, None, {}
+            
+            best_score = -float('inf')
+            best_symbol = None
+            best_strategy = None
+            all_stats = {}
+            
+            for row in rows:
+                symbol = row['symbol']
+                strategy = row['strategy_name'] or 'unknown'
+                total = row['total_trades']
+                wins = row['winning_trades'] or 0
+                total_profit = row['total_profit'] or 0
+                avg_win = row['avg_win'] or 0
+                avg_loss = abs(row['avg_loss'] or 1)
+                
+                win_rate = (wins / total * 100) if total > 0 else 0
+                profit_factor = (avg_win / avg_loss) if avg_loss > 0 else 0
+                
+                score = (total_profit * 0.4) + (win_rate * 10 * 0.3) + (profit_factor * 100 * 0.3)
+                
+                key = f"{symbol}_{strategy}"
+                all_stats[key] = {
+                    'symbol': symbol,
+                    'strategy': strategy,
+                    'total_trades': total,
+                    'winning_trades': wins,
+                    'total_profit': total_profit,
+                    'win_rate': win_rate,
+                    'profit_factor': profit_factor,
+                    'score': score
+                }
+                
+                if score > best_score:
+                    best_score = score
+                    best_symbol = symbol
+                    best_strategy = strategy
+            
+            return best_strategy, best_symbol, all_stats
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting best strategy/symbol: {e}")
+            return None, None, {}
+    
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            logger.info("✅ Database connection closed")
 
 class MT5Manager:
     
@@ -923,6 +1310,22 @@ class TradeManager:
                     self.telegram.notify_trade_opened(
                         ticket, direction_str, price, signal.stop_loss, 
                         signal.take_profit, volume
+                    )
+                
+                if hasattr(self, 'db'):
+                    direction_str = "BUY" if signal.direction == TrendDirection.BULLISH else "SELL"
+                    strategy_name = getattr(self, 'strategy_name', None)
+                    confidence = signal.confidence if hasattr(signal, 'confidence') else None
+                    self.db.save_trade(
+                        ticket=ticket,
+                        symbol=self.mt5.symbol,
+                        direction=direction_str,
+                        entry_price=entry_price,
+                        volume=volume,
+                        sl_initial=signal.stop_loss,
+                        tp_initial=signal.take_profit,
+                        strategy_name=strategy_name,
+                        confidence=confidence
                     )
 
                 self._add_sltp_later(ticket, signal)
@@ -1526,6 +1929,24 @@ class AdvancedGoldenmanAnalyzer:
         self.scalp_target_pips = 10
         self.scalp_max_risk_pips = 5
         self.min_scalp_confidence = 0.7
+        
+        if not hasattr(self, 'analyzer_weights'):
+            self.analyzer_weights = {
+                'ma_5': 1.0,
+                'ma_20': 1.5,
+                'ma_50': 2.0,
+                'momentum_5': 0.8,
+                'momentum_10': 1.2,
+                'cycles': 1.5,
+                'polynomial': 1.0,
+                'rsi': 0.8,
+                'base_signal': 0.5,
+                'fractal_signal': 0.25,
+                'symmetry_signal': 0.25
+            }
+        
+        if not hasattr(self, 'analyzer_predictions_history'):
+            self.analyzer_predictions_history = []
 
     def _should_update_timeframe(self, timeframe: int) -> bool:
         if timeframe == mt5.TIMEFRAME_M1:
@@ -1922,69 +2343,115 @@ class AdvancedGoldenmanAnalyzer:
                 ma_20 = np.mean(prices[-20:])
                 ma_50 = np.mean(prices[-50:])
                 
+                ma_5_weight = getattr(self, 'analyzer_weights', {}).get('ma_5', 1.0)
+                ma_20_weight = getattr(self, 'analyzer_weights', {}).get('ma_20', 1.5)
+                ma_50_weight = getattr(self, 'analyzer_weights', {}).get('ma_50', 2.0)
+                
+                ma_5_pred = TrendDirection.BULLISH if current_price > ma_5 else TrendDirection.BEARISH
+                ma_20_pred = TrendDirection.BULLISH if current_price > ma_20 else TrendDirection.BEARISH
+                ma_50_pred = TrendDirection.BULLISH if current_price > ma_50 else TrendDirection.BEARISH
+                
                 if current_price > ma_5:
-                    scores['bullish'] += 1 * 1.0
+                    scores['bullish'] += 1 * ma_5_weight
                 else:
-                    scores['bearish'] += 1 * 1.0
+                    scores['bearish'] += 1 * ma_5_weight
                 
                 if current_price > ma_20:
-                    scores['bullish'] += 1 * 1.5
+                    scores['bullish'] += 1 * ma_20_weight
                 else:
-                    scores['bearish'] += 1 * 1.5
+                    scores['bearish'] += 1 * ma_20_weight
                 
                 if current_price > ma_50:
-                    scores['bullish'] += 1 * 2.0
+                    scores['bullish'] += 1 * ma_50_weight
                 else:
-                    scores['bearish'] += 1 * 2.0
+                    scores['bearish'] += 1 * ma_50_weight
                 
-                scores['weight'] += 4.5
+                scores['weight'] += ma_5_weight + ma_20_weight + ma_50_weight
+                
+                if not hasattr(self, '_current_predictions'):
+                    self._current_predictions = {}
+                self._current_predictions['ma_5'] = ma_5_pred
+                self._current_predictions['ma_20'] = ma_20_pred
+                self._current_predictions['ma_50'] = ma_50_pred
             
             if len(prices) >= 10:
                 momentum_5 = prices[-1] - prices[-5]
                 momentum_10 = prices[-1] - prices[-10]
                 
+                momentum_5_weight = getattr(self, 'analyzer_weights', {}).get('momentum_5', 0.8)
+                momentum_10_weight = getattr(self, 'analyzer_weights', {}).get('momentum_10', 1.2)
+                
+                momentum_5_pred = TrendDirection.BULLISH if momentum_5 > 0 else TrendDirection.BEARISH
+                momentum_10_pred = TrendDirection.BULLISH if momentum_10 > 0 else TrendDirection.BEARISH
+                
                 if momentum_5 > 0:
-                    scores['bullish'] += 1 * 0.8
+                    scores['bullish'] += 1 * momentum_5_weight
                 else:
-                    scores['bearish'] += 1 * 0.8
+                    scores['bearish'] += 1 * momentum_5_weight
                 
                 if momentum_10 > 0:
-                    scores['bullish'] += 1 * 1.2
+                    scores['bullish'] += 1 * momentum_10_weight
                 else:
-                    scores['bearish'] += 1 * 1.2
+                    scores['bearish'] += 1 * momentum_10_weight
                 
-                scores['weight'] += 2.0
+                scores['weight'] += momentum_5_weight + momentum_10_weight
+                
+                if not hasattr(self, '_current_predictions'):
+                    self._current_predictions = {}
+                self._current_predictions['momentum_5'] = momentum_5_pred
+                self._current_predictions['momentum_10'] = momentum_10_pred
             
             if cycles and len(cycles) >= 3:
                 recent_cycles = cycles[-3:]
                 
                 avg_movement = np.mean([c.net_movement for c in recent_cycles])
                 
-                if avg_movement > 0:
-                    scores['bullish'] += 1 * 1.5
-                else:
-                    scores['bearish'] += 1 * 1.5
+                cycles_weight = getattr(self, 'analyzer_weights', {}).get('cycles', 1.5)
+                cycles_pred = TrendDirection.BULLISH if avg_movement > 0 else TrendDirection.BEARISH
                 
-                scores['weight'] += 1.5
+                if avg_movement > 0:
+                    scores['bullish'] += 1 * cycles_weight
+                else:
+                    scores['bearish'] += 1 * cycles_weight
+                
+                scores['weight'] += cycles_weight
+                
+                if not hasattr(self, '_current_predictions'):
+                    self._current_predictions = {}
+                self._current_predictions['cycles'] = cycles_pred
             
             if poly_functions:
                 recent_func = poly_functions[-1]
                 
-                if recent_func.velocity > 0:
-                    scores['bullish'] += 1 * 1.0
-                else:
-                    scores['bearish'] += 1 * 1.0
+                poly_weight = getattr(self, 'analyzer_weights', {}).get('polynomial', 1.0)
+                poly_pred = TrendDirection.BULLISH if recent_func.velocity > 0 else TrendDirection.BEARISH
                 
-                scores['weight'] += 1.0
+                if recent_func.velocity > 0:
+                    scores['bullish'] += 1 * poly_weight
+                else:
+                    scores['bearish'] += 1 * poly_weight
+                
+                scores['weight'] += poly_weight
+                
+                if not hasattr(self, '_current_predictions'):
+                    self._current_predictions = {}
+                self._current_predictions['polynomial'] = poly_pred
             
             if len(prices) >= 14:
                 rsi = self._calculate_rsi(prices, period=14)
-                if rsi > 50:
-                    scores['bullish'] += 1 * 0.8
-                else:
-                    scores['bearish'] += 1 * 0.8
+                rsi_weight = getattr(self, 'analyzer_weights', {}).get('rsi', 0.8)
+                rsi_pred = TrendDirection.BULLISH if rsi > 50 else TrendDirection.BEARISH
                 
-                scores['weight'] += 0.8
+                if rsi > 50:
+                    scores['bullish'] += 1 * rsi_weight
+                else:
+                    scores['bearish'] += 1 * rsi_weight
+                
+                scores['weight'] += rsi_weight
+                
+                if not hasattr(self, '_current_predictions'):
+                    self._current_predictions = {}
+                self._current_predictions['rsi'] = rsi_pred
             
             if scores['weight'] == 0:
                 return TrendDirection.NEUTRAL
@@ -3949,8 +4416,12 @@ class EnhancedGoldenmanAnalyzer(AdvancedGoldenmanAnalyzer):
         signals = []
         weights = []
         
+        base_weight = getattr(self, 'analyzer_weights', {}).get('base_signal', 0.5)
+        fractal_weight = getattr(self, 'analyzer_weights', {}).get('fractal_signal', 0.25)
+        symmetry_weight = getattr(self, 'analyzer_weights', {}).get('symmetry_signal', 0.25)
+        
         signals.append(base_signal)
-        weights.append(0.5)
+        weights.append(base_weight)
         
         if fractal_result and fractal_result.get('signal', {}).get('fractal_aligned', False):
             fractal_conf = fractal_result['signal']['confidence']
@@ -3969,11 +4440,11 @@ class EnhancedGoldenmanAnalyzer(AdvancedGoldenmanAnalyzer):
                     timestamp=datetime.now()
                 )
                 signals.append(fractal_signal)
-                weights.append(0.25)
+                weights.append(fractal_weight)
         
         if symmetry_signal and symmetry_signal.confidence > 0.7:
             signals.append(symmetry_signal)
-            weights.append(0.25)
+            weights.append(symmetry_weight)
         
         if len(signals) == 1:
             return signals[0]
@@ -5374,12 +5845,23 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             self.stop()
 
     def _optimized_main_loop(self):
+
+        logger.info("⏳ Waiting 10 seconds before starting trading...")
+        time.sleep(10)
+        logger.info("✅ Trading started!")
         
         previous_positions = set()
+        last_daily_report_date = None
         
         while self.running:
             try:
                 current_time = datetime.now()
+                
+                if hasattr(self, 'telegram') and self.telegram.enabled and hasattr(self, 'db'):
+                    current_date = current_time.date()
+                    if last_daily_report_date != current_date and current_time.hour >= 8:
+                        self.telegram.send_daily_report(self.db)
+                        last_daily_report_date = current_date
                 
                 positions = mt5.positions_get(symbol=self.symbol)
                 current_tickets = {pos.ticket for pos in positions} if positions else set()
@@ -5630,13 +6112,19 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             logger.info("🎉 Node-Based Trailing ACTIVE")
             
             self.total_trades += 1
+            
+            predictions = {}
+            if hasattr(self.nds, '_current_predictions'):
+                predictions = self.nds._current_predictions.copy()
+            
             self.trade_history.append({
                 'ticket': ticket,
                 'entry_time': datetime.now(),
                 'entry_price': pos.price_open,
                 'volume': pos.volume,
                 'direction': signal.direction,
-                'signal_confidence': signal.confidence
+                'signal_confidence': signal.confidence,
+                'predictions': predictions
             })
             
             return ticket
@@ -5668,6 +6156,19 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             
             if hasattr(self, 'telegram'):
                 self.telegram.notify_trade_closed(ticket, total_profit, close_reason)
+
+            if hasattr(self, 'db'):
+                positions = mt5.positions_get(ticket=ticket)
+                if positions:
+                    pos = positions[0]
+                    self.db.update_trade_close(
+                        ticket=ticket,
+                        exit_price=pos.price_current,
+                        profit=total_profit,
+                        close_reason=close_reason,
+                        sl_final=pos.sl,
+                        tp_final=pos.tp
+                    )
 
             self._update_rl_after_trade_close(ticket, total_profit)
             
@@ -5744,10 +6245,86 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                                                           reward, 
                                                           done=True)
             
+            self._update_analyzer_weights(trade_info, profit)
+            
+            if hasattr(self, 'db'):
+                self.db.save_analyzer_weights(self.symbol, self.nds.analyzer_weights)
+            
             logger.info(f"📊 RL updated for trade #{ticket}, Profit: ${profit:.2f}, Reward: {reward:.4f}")
             
         except Exception as e:
             logger.error(f"Error updating RL after trade close: {e}")
+    
+    def _update_analyzer_weights(self, trade_info: dict, profit: float):
+        
+        try:
+            if 'predictions' not in trade_info or not trade_info['predictions']:
+                return
+            
+            predictions = trade_info['predictions']
+            trade_direction = trade_info['direction']
+            is_profitable = profit > 0
+            
+            learning_rate = 0.05
+            min_weight = 0.1
+            max_weight = 5.0
+            
+            if not hasattr(self.nds, 'analyzer_weights'):
+                self.nds.analyzer_weights = {
+                    'ma_5': 1.0, 'ma_20': 1.5, 'ma_50': 2.0,
+                    'momentum_5': 0.8, 'momentum_10': 1.2,
+                    'cycles': 1.5, 'polynomial': 1.0, 'rsi': 0.8
+                }
+            
+            for analyzer_name, predicted_direction in predictions.items():
+                if analyzer_name not in self.nds.analyzer_weights:
+                    continue
+                
+                predicted_correct = False
+                
+                if is_profitable:
+                    if trade_direction == TrendDirection.BULLISH and predicted_direction == TrendDirection.BULLISH:
+                        predicted_correct = True
+                    elif trade_direction == TrendDirection.BEARISH and predicted_direction == TrendDirection.BEARISH:
+                        predicted_correct = True
+                else:
+                    if trade_direction == TrendDirection.BULLISH and predicted_direction == TrendDirection.BEARISH:
+                        predicted_correct = True
+                    elif trade_direction == TrendDirection.BEARISH and predicted_direction == TrendDirection.BULLISH:
+                        predicted_correct = True
+                
+                current_weight = self.nds.analyzer_weights[analyzer_name]
+                
+                if predicted_correct:
+                    new_weight = current_weight * (1 + learning_rate)
+                    new_weight = min(new_weight, max_weight)
+                else:
+                    new_weight = current_weight * (1 - learning_rate)
+                    new_weight = max(new_weight, min_weight)
+                
+                self.nds.analyzer_weights[analyzer_name] = new_weight
+            
+            signal_weights_to_update = ['base_signal', 'fractal_signal', 'symmetry_signal']
+            for signal_weight_name in signal_weights_to_update:
+                if signal_weight_name not in self.nds.analyzer_weights:
+                    continue
+                
+                current_weight = self.nds.analyzer_weights[signal_weight_name]
+                
+                if is_profitable:
+                    new_weight = current_weight * (1 + learning_rate * 0.5)
+                    new_weight = min(new_weight, max_weight)
+                else:
+                    new_weight = current_weight * (1 - learning_rate * 0.5)
+                    new_weight = max(new_weight, min_weight)
+                
+                self.nds.analyzer_weights[signal_weight_name] = new_weight
+            
+            logger.info(f"📈 Analyzer weights updated after trade #{trade_info['ticket']}")
+            logger.info(f"   Weights: {', '.join([f'{k}={v:.3f}' for k, v in self.nds.analyzer_weights.items()])}")
+            
+        except Exception as e:
+            logger.error(f"Error updating analyzer weights: {e}")
         
     def _should_report(self, current_time: datetime) -> bool:
         if not hasattr(self, '_last_report'):
@@ -5916,6 +6493,35 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
         
         bot_instance = self
         self.nds._calculate_levels_simple = lambda direction, df: bot_instance._calculate_levels_strategy_based(direction, df)
+        
+        self.db = DatabaseManager()
+        self._load_analyzer_weights_from_db()
+        self.db.cleanup_old_data()
+        
+        best_strategy, best_symbol = self._select_best_strategy_and_symbol()
+        if best_strategy and best_symbol:
+            if best_strategy != self.strategy_name:
+                logger.info(f"🔄 Switching to best strategy: {best_strategy}")
+                self.strategy_name = best_strategy
+                if best_strategy == "day_trading":
+                    self.strategy_config = StrategyConfig.day_trading()
+                elif best_strategy == "scalping":
+                    self.strategy_config = StrategyConfig.scalping()
+                elif best_strategy == "super_scalping":
+                    self.strategy_config = StrategyConfig.super_scalping()
+                self.nds.tf_trend = self.strategy_config.trend_tf
+                self.nds.tf_analysis = self.strategy_config.fine_analysis_tf
+                self.nds.tf_entry = self.strategy_config.entry_tf
+            
+            if best_symbol != self.symbol:
+                logger.info(f"🔄 Switching to best symbol: {best_symbol}")
+                self.symbol = best_symbol
+                self.mt5.symbol = best_symbol
+                self.original_symbol = best_symbol
+                if not self.mt5.connect():
+                    logger.error(f"❌ Failed to switch to {best_symbol}, keeping {self.original_symbol}")
+                    self.symbol = self.original_symbol
+                    self.mt5.symbol = self.original_symbol
 
         self._exit_signal_logged = {}
         
@@ -5935,6 +6541,39 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
                 logger.warning(f"⚠️ BTCUSD also not available, keeping {self.symbol}")
     
         self._check_and_set_sltp_for_open_positions()
+        
+        self._last_daily_report = None
+        self._start_time = datetime.now()
+    
+    def _select_best_strategy_and_symbol(self) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            if hasattr(self, 'db'):
+                best_strategy, best_symbol, all_stats = self.db.get_best_strategy_and_symbol(days=30)
+                if best_strategy and best_symbol:
+                    logger.info(f"📊 Best configuration found: {best_symbol} with {best_strategy}")
+                    best_stats = all_stats.get(f"{best_symbol}_{best_strategy}", {})
+                    logger.info(f"   Score: {best_stats.get('score', 0):.2f}, Profit: ${best_stats.get('total_profit', 0):.2f}, Win Rate: {best_stats.get('win_rate', 0):.1f}%")
+                else:
+                    logger.info(f"ℹ️ No sufficient data for auto-selection, using defaults")
+                return best_strategy, best_symbol
+            return None, None
+        except Exception as e:
+            logger.error(f"❌ Error selecting best strategy/symbol: {e}")
+            return None, None
+    
+    def _load_analyzer_weights_from_db(self):
+        try:
+            if hasattr(self, 'db'):
+                loaded_weights = self.db.load_analyzer_weights(self.symbol)
+                if loaded_weights:
+                    if not hasattr(self.nds, 'analyzer_weights'):
+                        self.nds.analyzer_weights = {}
+                    self.nds.analyzer_weights.update(loaded_weights)
+                    logger.info(f"✅ Loaded analyzer weights from database for {self.symbol}")
+                else:
+                    logger.info(f"ℹ️ No saved weights found for {self.symbol}, using defaults")
+        except Exception as e:
+            logger.error(f"❌ Error loading analyzer weights: {e}")
 
     def _check_and_set_sltp_for_open_positions(self):
 
@@ -6396,11 +7035,22 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
     
     def _optimized_main_loop(self):
 
+        logger.info("⏳ Waiting 10 seconds before starting trading...")
+        time.sleep(10)
+        logger.info("✅ Trading started!")
+        
         previous_positions = set()
+        last_daily_report_date = None
         
         while self.running:
             try:
                 current_time = datetime.now()
+                
+                if hasattr(self, 'telegram') and self.telegram.enabled and hasattr(self, 'db'):
+                    current_date = current_time.date()
+                    if last_daily_report_date != current_date and current_time.hour >= 8:
+                        self.telegram.send_daily_report(self.db)
+                        last_daily_report_date = current_date
                 
                 positions = mt5.positions_get(symbol=self.symbol)
                 current_tickets = {pos.ticket for pos in positions} if positions else set()
