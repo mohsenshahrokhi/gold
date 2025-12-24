@@ -6066,8 +6066,8 @@ class ImprovedNodeBasedTrailing:
         
         'peak_price': entry_price,
         
-        'spread': 10.0,
-        'commission': 0.0,
+        'spread': spread,
+        'commission': commission,
 
             'stage_10pct': False,
             'stage_15pct': False,
@@ -6398,16 +6398,23 @@ class ImprovedNodeBasedTrailing:
                 state['stage_15pct'] = True
                 logger.info(f"🔹 STAGE 2: 15% crossed - BREAKEVEN")
                 
-                spread_pips = state['spread']
-                commission_pips = state['commission'] / self.point
+                spread_value = state['spread']
+                commission_value = state['commission']
                 
                 if state['direction'] == 'BUY':
-                    new_sl = state['entry_price'] + (spread_pips * self.point) + (commission_pips * self.point)
+                    new_sl = state['entry_price'] + spread_value + commission_value + (2 * self.point)
+                    if new_sl <= state['current_sl']:
+                        new_sl = state['current_sl'] + (2 * self.point)
                 else:
-                    new_sl = state['entry_price'] - (spread_pips * self.point) - (commission_pips * self.point)
+                    new_sl = state['entry_price'] - spread_value - commission_value - (2 * self.point)
+                    if new_sl >= state['current_sl']:
+                        new_sl = state['current_sl'] - (2 * self.point)
+                
+                spread_pips = spread_value / self.point if self.point > 0 else 0
+                commission_pips = commission_value / self.point if self.point > 0 else 0
                 
                 if self.update_sl(ticket, new_sl, "15% - Breakeven + Spread + Comm"):
-                    logger.info(f"   → SL to {new_sl:.2f} (BE + {spread_pips:.0f}p spread + {commission_pips:.1f}p comm)")
+                    logger.info(f"   → SL to {new_sl:.2f} (BE + {spread_pips:.1f}p spread + {commission_pips:.1f}p comm)")
                 else:
                     logger.warning(f"   ⚠️ Failed to update SL to breakeven")
             
@@ -6649,6 +6656,20 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 traceback.print_exc()
                 time.sleep(5)
 
+    def _calculate_commission_for_trade(self) -> float:
+        try:
+            symbol_info = mt5.symbol_info(self.symbol)
+            if symbol_info:
+                commission = getattr(symbol_info, 'commission', 0.0) or 0.0
+                if commission > 0 and hasattr(symbol_info, 'trade_contract_size') and symbol_info.trade_contract_size > 0:
+                    point = self.mt5.get_point() if hasattr(self.mt5, 'get_point') else 0.1
+                    commission_points = abs(commission) / (symbol_info.trade_contract_size * point)
+                    return commission_points
+            return 0.0
+        except Exception as e:
+            logger.debug(f"Error calculating commission: {e}")
+            return 0.0
+    
     def _adopt_existing_trade(self, ticket: int):
 
         try:
@@ -6743,7 +6764,7 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 direction="BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL",
                 nodes=nodes,
                 spread=self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 5.0,
-                commission=0.5
+                commission=self._calculate_commission_for_trade()
             )
             
             logger.info(f"✅ Trade #{ticket} adopted successfully!")
@@ -6791,7 +6812,7 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 direction="BUY" if signal.direction == TrendDirection.BULLISH else "SELL",
                 nodes=nodes,
                 spread=spread_pips,
-                commission=commission
+                commission=self._calculate_commission_for_trade()
             )
             
             logger.info("🎉 Node-Based Trailing ACTIVE")
@@ -7505,7 +7526,7 @@ class UnifiedTradingBot(OptimizedGoldenmanBot):
                                     direction='BUY' if position.type == mt5.ORDER_TYPE_BUY else 'SELL',
                                     nodes=nodes,
                                     spread=self.mt5.get_spread() if hasattr(self.mt5, 'get_spread') else 0.0,
-                                    commission=0.0
+                                    commission=self._calculate_commission_for_trade()
                                 )
                                 logger.info(f"   ✅ Trade state initialized for position #{position.ticket}")
                             except Exception as e:
