@@ -6470,10 +6470,42 @@ class ImprovedNodeBasedTrailing:
                 else:
                     new_sl = last_node + safety_margin
                 
+                logger.info(f"📊 Node-based SL Calculation:")
+                logger.info(f"   Direction: {state['direction']}")
+                logger.info(f"   Last Node Below Entry: {last_node:.2f}")
+                logger.info(f"   Safety Margin: {safety_margin:.2f}")
+                logger.info(f"   Calculated SL: {new_sl:.2f}")
+                logger.info(f"   Current SL: {state.get('current_sl', 0):.2f}")
+                logger.info(f"   Current Price: {current_price:.2f}")
+                
+                symbol_info = mt5.symbol_info(self.symbol)
+                if symbol_info:
+                    min_distance = max(symbol_info.trade_stops_level * self.point, 10 * self.point)
+                    if state['direction'] == 'BUY':
+                        min_allowed_sl = current_price - min_distance
+                        if new_sl >= min_allowed_sl:
+                            logger.warning(f"   ⚠️ Calculated SL too close to current price")
+                            logger.warning(f"   📊 Calculated SL: {new_sl:.2f}")
+                            logger.warning(f"   📊 Min Allowed SL: {min_allowed_sl:.2f} (current - {min_distance:.2f})")
+                            logger.warning(f"   📊 Distance: {current_price - new_sl:.2f} points (needs {min_distance:.2f})")
+                            logger.warning(f"   ⏸️ Skipping SL update - too close to current price")
+                            return
+                    else:
+                        max_allowed_sl = current_price + min_distance
+                        if new_sl <= max_allowed_sl:
+                            logger.warning(f"   ⚠️ Calculated SL too close to current price")
+                            logger.warning(f"   📊 Calculated SL: {new_sl:.2f}")
+                            logger.warning(f"   📊 Max Allowed SL: {max_allowed_sl:.2f} (current + {min_distance:.2f})")
+                            logger.warning(f"   📊 Distance: {new_sl - current_price:.2f} points (needs {min_distance:.2f})")
+                            logger.warning(f"   ⏸️ Skipping SL update - too close to current price")
+                            return
+                
                 if self.update_sl(ticket, new_sl, "10% - Last node below entry"):
-                    logger.info(f"   → SL to {new_sl:.2f} (node @ {last_node:.2f})")
+                    logger.info(f"   ✅ SL updated to {new_sl:.2f} (node @ {last_node:.2f})")
                 else:
                     logger.warning(f"   ⚠️ Failed to update SL to node")
+                    logger.warning(f"   📊 Calculated SL: {new_sl:.2f}, Current Price: {current_price:.2f}")
+                    logger.warning(f"   📊 Check if SL is too close to current price or invalid")
             
             stage_15pct = getattr(self.bot_instance, 'risk_params', {}).get('stage_15pct_breakeven', 0.15) * 100 if hasattr(self, 'bot_instance') and hasattr(self.bot_instance, 'risk_params') else 15.0
             if not state['stage_15pct'] and progress_pct >= stage_15pct:
@@ -6494,10 +6526,24 @@ class ImprovedNodeBasedTrailing:
                     logger.warning(f"   ⚠️ Cannot get symbol info for breakeven")
                     return
                 
+                trade_direction = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
                 current_price = symbol_info.ask if pos.type == mt5.ORDER_TYPE_BUY else symbol_info.bid
                 min_distance = max(symbol_info.trade_stops_level * self.point, 10 * self.point)
                 
+                logger.info(f"📊 Breakeven Setup:")
+                logger.info(f"   Trade Direction: {trade_direction} (State: {state.get('direction', 'N/A')})")
+                logger.info(f"   Entry Price: {state['entry_price']:.2f}")
+                logger.info(f"   Current Price: {current_price:.2f}")
+                price_movement_pct = ((current_price - state['entry_price']) / state['entry_price'] * 100)
+                logger.info(f"   Price Movement: {price_movement_pct:+.2f}%")
+                logger.info(f"   Current SL: {state['current_sl']:.2f}")
+                logger.info(f"   Progress: {progress_pct:.1f}%")
+                
                 if state['direction'] == 'BUY':
+                    if current_price < state['entry_price']:
+                        logger.warning(f"   ⚠️ Trade is in loss (Current {current_price:.2f} < Entry {state['entry_price']:.2f})")
+                        logger.warning(f"   ⏸️ Cannot set breakeven - waiting for price to recover above entry")
+                        return
                     breakeven_base = state['entry_price'] + spread_value + commission_value
                     new_sl = breakeven_base + (2 * self.point)
                     
@@ -6527,9 +6573,15 @@ class ImprovedNodeBasedTrailing:
                             logger.warning(f"   📊 Required SL: {min_required_sl:.2f} (entry + {min_breakeven_distance:.2f})")
                             logger.warning(f"   📊 Max allowed SL: {min_allowed_sl:.2f} (current - {min_distance:.2f})")
                             logger.warning(f"   📊 Current Price: {current_price:.2f}, Entry: {state['entry_price']:.2f}")
+                            logger.warning(f"   📊 Price is {'below' if current_price < state['entry_price'] else 'above'} entry - {'waiting for recovery' if current_price < state['entry_price'] else 'need more distance'}")
                             logger.warning(f"   ⏸️ Waiting for price to move further before setting breakeven")
                             return
                 else:
+                    if current_price > state['entry_price']:
+                        logger.warning(f"   ⚠️ Trade is in loss (Current {current_price:.2f} > Entry {state['entry_price']:.2f})")
+                        logger.warning(f"   ⏸️ Cannot set breakeven - waiting for price to recover below entry")
+                        return
+                    
                     breakeven_base = state['entry_price'] - spread_value - commission_value
                     new_sl = breakeven_base - (2 * self.point)
                     
@@ -6549,6 +6601,12 @@ class ImprovedNodeBasedTrailing:
                         safe_sl = max_allowed_sl + (10 * self.point)
                         max_required_sl = state['entry_price'] - min_breakeven_distance
                         
+                        logger.info(f"📊 SELL Breakeven Check:")
+                        logger.info(f"   Calculated SL: {new_sl:.2f}")
+                        logger.info(f"   Max Required SL: {max_required_sl:.2f} (entry - {min_breakeven_distance:.2f})")
+                        logger.info(f"   Min Allowed SL: {max_allowed_sl:.2f} (current + {min_distance:.2f})")
+                        logger.info(f"   Safe SL: {safe_sl:.2f} (min_allowed + 10*point)")
+                        
                         if safe_sl <= max_required_sl:
                             new_sl = safe_sl
                             logger.warning(f"   ⚠️ Breakeven SL too close to current price, adjusted to {new_sl:.2f}")
@@ -6558,7 +6616,9 @@ class ImprovedNodeBasedTrailing:
                             logger.warning(f"   ⚠️ Cannot set breakeven SL - too close to current price")
                             logger.warning(f"   📊 Required SL: {max_required_sl:.2f} (entry - {min_breakeven_distance:.2f})")
                             logger.warning(f"   📊 Min allowed SL: {max_allowed_sl:.2f} (current + {min_distance:.2f})")
+                            logger.warning(f"   📊 Gap needed: {max_required_sl - max_allowed_sl:.2f} points")
                             logger.warning(f"   📊 Current Price: {current_price:.2f}, Entry: {state['entry_price']:.2f}")
+                            logger.warning(f"   📊 Price is {'above' if current_price > state['entry_price'] else 'below'} entry - {'waiting for recovery' if current_price > state['entry_price'] else 'need more distance'}")
                             logger.warning(f"   ⏸️ Waiting for price to move further before setting breakeven")
                             return
                 
@@ -6964,10 +7024,12 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
             
             symbol_info = mt5.symbol_info(self.symbol)
             spread_pips = symbol_info.spread if symbol_info else 10.0
+            point = symbol_info.point if symbol_info else self.point
+            spread_points = spread_pips * point
             commission = self._calculate_commission_for_trade()
             
             logger.info(f"📊 Market Info:")
-            logger.info(f"   Spread: {spread_pips:.1f} pips")
+            logger.info(f"   Spread: {spread_pips:.1f} pips ({spread_points:.2f} points)")
             logger.info(f"   Commission: {commission:.2f} points")
             
             nodes = self.trailing_manager.detect_nodes(
@@ -7004,7 +7066,7 @@ class OptimizedGoldenmanBot(EnhancedGoldenmanBot):
                 volume=pos.volume,
                 direction="BUY" if signal.direction == TrendDirection.BULLISH else "SELL",
                 nodes=nodes,
-                spread=spread_pips,
+                spread=spread_points,
                 commission=commission
             )
             
